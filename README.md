@@ -148,7 +148,7 @@ gitagent install-skill
 
 ```bash
 git clone https://github.com/david-fm/gawt
-cd gitagent
+cd gawt
 make install-skill
 # (equivalent to: bash scripts/install-skill.sh)
 ```
