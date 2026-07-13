@@ -11,11 +11,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import gitwrap
+from . import feature, gitwrap
 from .errors import GitAgentError
 from .models import Agent, Proposal, Review, Session
 
 GITAGENT_DIR = ".gitagent"
+FEATURES_DIR = "features"
 
 
 def now() -> str:
@@ -26,6 +27,7 @@ def now() -> str:
 @dataclass
 class Paths:
     root: Path
+    feature: Path
     session: Path
     agents: Path
     proposals: Path
@@ -34,17 +36,42 @@ class Paths:
     log: Path
 
 
-def paths(repo: Path) -> Paths:
+def paths(repo: Path, feature_key: str) -> Paths:
     root = repo / GITAGENT_DIR
+    f = root / FEATURES_DIR / feature_key
     return Paths(
         root=root,
-        session=root / "session.json",
-        agents=root / "agents",
-        proposals=root / "proposals",
-        integration=root / "integration",
-        locks=root / "locks",
+        feature=f,
+        session=f / "session.json",
+        agents=f / "agents",
+        proposals=f / "proposals",
+        integration=f / "integration",
+        locks=f / "locks",
         log=root / "log.jsonl",
     )
+
+
+def global_log_path(repo: Path) -> Path:
+    """The path of the global, cross-feature audit log."""
+    return repo / GITAGENT_DIR / "log.jsonl"
+
+
+def log_event_at(log_path: Path, event: dict[str, Any]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"ts": now(), **event}
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def read_log_at(log_path: Path) -> list[dict[str, Any]]:
+    if not log_path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in log_path.read_text().splitlines():
+        line = line.strip()
+        if line:
+            entries.append(json.loads(line))
+    return entries
 
 
 def initialized(repo: Path) -> bool:
@@ -56,115 +83,138 @@ def require_init(repo: Path) -> None:
         raise GitAgentError("gitagent is not initialized. Run `gitagent init` first.")
 
 
-def ensure_dirs(repo: Path) -> None:
-    p = paths(repo)
-    for d in (p.root, p.agents, p.proposals, p.integration, p.locks):
+def list_features(repo: Path) -> list[str]:
+    """Return sorted feature keys present in the .gitagent/features/ directory."""
+    d = repo / GITAGENT_DIR / FEATURES_DIR
+    if not d.is_dir():
+        return []
+    return sorted(p.name for p in d.iterdir() if p.is_dir())
+
+
+def current_feature_paths(repo: Path) -> Paths:
+    """Resolve paths for the active feature, based on the current git branch.
+
+    The branch must be a feature branch (prefix `ga/`). The feature key is
+    derived from the branch name.
+    """
+    require_init(repo)
+    branch = gitwrap.current_branch(repo)
+    if branch is None:
+        raise GitAgentError("HEAD is detached. Check out a feature branch to operate.")
+    if not feature.is_feature_branch(branch):
+        raise GitAgentError(
+            f"Current branch '{branch}' is not a feature branch. "
+            f"Run `git checkout -b {feature.FEATURE_PREFIX}<name>` to create one. "
+            f"`finalize` never lands on 'main' or 'master'."
+        )
+    return paths(repo, feature.slugify(branch))
+
+
+def ensure_dirs(p: Paths) -> None:
+    for d in (p.root, p.feature, p.agents, p.proposals, p.integration, p.locks):
         d.mkdir(parents=True, exist_ok=True)
 
 
-def load_session(repo: Path) -> Session | None:
-    p = paths(repo).session
-    if not p.exists():
+def load_session(p: Paths) -> Session | None:
+    if not p.session.exists():
         return None
-    return Session.from_dict(_read_json(p))
+    return Session.from_dict(_read_json(p.session))
 
 
-def require_session(repo: Path) -> Session:
-    s = load_session(repo)
+def require_session(p: Paths) -> Session:
+    s = load_session(p)
     if s is None:
-        raise GitAgentError("No active session. Run `gitagent start --feature <name>` first.")
+        raise GitAgentError("No active session for this feature. Run `gitagent start` first.")
     return s
 
 
-def save_session(repo: Path, session: Session) -> None:
+def save_session(p: Paths, session: Session) -> None:
     session.updated_at = now()
-    _write_json(paths(repo).session, session.to_dict())
+    _write_json(p.session, session.to_dict())
 
 
-def agent_ids(repo: Path) -> list[str]:
-    d = paths(repo).agents
+def agent_ids(p: Paths) -> list[str]:
+    d = p.agents
     if not d.exists():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir())
+    return sorted(x.name for x in d.iterdir() if x.is_dir())
 
 
-def agent_dir(repo: Path, agent_id: str) -> Path:
-    return paths(repo).agents / agent_id
+def agent_dir(p: Paths, agent_id: str) -> Path:
+    return p.agents / agent_id
 
 
-def load_agent(repo: Path, agent_id: str) -> Agent:
-    f = agent_dir(repo, agent_id) / "meta.json"
+def load_agent(p: Paths, agent_id: str) -> Agent:
+    f = agent_dir(p, agent_id) / "meta.json"
     if not f.exists():
-        raise GitAgentError(f"No agent with id '{agent_id}'.")
+        raise GitAgentError(f"No agent with id '{agent_id}' in this feature.")
     return Agent.from_dict(_read_json(f))
 
 
-def save_agent(repo: Path, agent: Agent) -> None:
-    agent_dir(repo, agent.id).mkdir(parents=True, exist_ok=True)
-    _write_json(agent_dir(repo, agent.id) / "meta.json", agent.to_dict())
+def save_agent(p: Paths, agent: Agent) -> None:
+    agent_dir(p, agent.id).mkdir(parents=True, exist_ok=True)
+    _write_json(agent_dir(p, agent.id) / "meta.json", agent.to_dict())
 
 
-def proposal_ids(repo: Path) -> list[str]:
-    d = paths(repo).proposals
+def proposal_ids(p: Paths) -> list[str]:
+    d = p.proposals
     if not d.exists():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir())
+    return sorted(x.name for x in d.iterdir() if x.is_dir())
 
 
-def proposal_dir(repo: Path, proposal_id: str) -> Path:
-    return paths(repo).proposals / proposal_id
+def proposal_dir(p: Paths, proposal_id: str) -> Path:
+    return p.proposals / proposal_id
 
 
-def load_proposal(repo: Path, proposal_id: str) -> Proposal:
-    f = proposal_dir(repo, proposal_id) / "manifest.json"
+def load_proposal(p: Paths, proposal_id: str) -> Proposal:
+    f = proposal_dir(p, proposal_id) / "manifest.json"
     if not f.exists():
-        raise GitAgentError(f"No proposal with id '{proposal_id}'.")
+        raise GitAgentError(f"No proposal with id '{proposal_id}' in this feature.")
     return Proposal.from_dict(_read_json(f))
 
 
-def save_proposal(repo: Path, proposal: Proposal) -> None:
-    d = proposal_dir(repo, proposal.id)
+def save_proposal(p: Paths, proposal: Proposal) -> None:
+    d = proposal_dir(p, proposal.id)
     d.mkdir(parents=True, exist_ok=True)
     _write_json(d / "manifest.json", proposal.to_dict())
 
 
-def patch_path(repo: Path, proposal_id: str) -> Path:
-    return proposal_dir(repo, proposal_id) / "change.patch"
+def patch_path(p: Paths, proposal_id: str) -> Path:
+    return proposal_dir(p, proposal_id) / "change.patch"
 
 
-def read_patch(repo: Path, proposal_id: str) -> str:
-    p = patch_path(repo, proposal_id)
-    if not p.exists():
+def read_patch(p: Paths, proposal_id: str) -> str:
+    fp = patch_path(p, proposal_id)
+    if not fp.exists():
         raise GitAgentError(f"No patch for proposal '{proposal_id}'.")
-    return p.read_text()
+    return fp.read_text()
 
 
-def load_review(repo: Path, proposal_id: str) -> Review:
-    f = proposal_dir(repo, proposal_id) / "review.json"
+def load_review(p: Paths, proposal_id: str) -> Review:
+    f = proposal_dir(p, proposal_id) / "review.json"
     if not f.exists():
         return Review()
     return Review.from_dict(_read_json(f))
 
 
-def save_review(repo: Path, proposal_id: str, review: Review) -> None:
-    proposal_dir(repo, proposal_id).mkdir(parents=True, exist_ok=True)
-    _write_json(proposal_dir(repo, proposal_id) / "review.json", review.to_dict())
+def save_review(p: Paths, proposal_id: str, review: Review) -> None:
+    proposal_dir(p, proposal_id).mkdir(parents=True, exist_ok=True)
+    _write_json(proposal_dir(p, proposal_id) / "review.json", review.to_dict())
 
 
-def log_event(repo: Path, event: dict[str, Any]) -> None:
-    p = paths(repo).log
-    p.parent.mkdir(parents=True, exist_ok=True)
+def log_event(p: Paths, event: dict[str, Any]) -> None:
+    p.log.parent.mkdir(parents=True, exist_ok=True)
     record = {"ts": now(), **event}
-    with p.open("a", encoding="utf-8") as fh:
+    with p.log.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def read_log(repo: Path) -> list[dict[str, Any]]:
-    p = paths(repo).log
-    if not p.exists():
+def read_log(p: Paths) -> list[dict[str, Any]]:
+    if not p.log.exists():
         return []
     entries: list[dict[str, Any]] = []
-    for line in p.read_text().splitlines():
+    for line in p.log.read_text().splitlines():
         line = line.strip()
         if line:
             entries.append(json.loads(line))
@@ -172,8 +222,8 @@ def read_log(repo: Path) -> list[dict[str, Any]]:
 
 
 @contextlib.contextmanager
-def lock(repo: Path, name: str) -> Iterator[None]:
-    d = paths(repo).locks
+def lock(p: Paths, name: str) -> Iterator[None]:
+    d = p.locks
     d.mkdir(parents=True, exist_ok=True)
     lf = d / f"{name}.lock"
     fd = os.open(lf, os.O_CREAT | os.O_RDWR, 0o644)
@@ -185,22 +235,38 @@ def lock(repo: Path, name: str) -> Iterator[None]:
         os.close(fd)
 
 
-def teardown(repo: Path, session: Session, *, keep_log: bool = True) -> None:
-    """Remove all worktrees/branches for the session and reset .gitagent state."""
-    for agent_id in agent_ids(repo):
+def teardown(
+    p: Paths,
+    session: Session,
+    *,
+    keep_log: bool = True,
+    delete_integration_branch: bool = True,
+) -> None:
+    """Reset a single feature's state.
+
+    Removes all agent worktrees/ephemeral branches and the integration worktree.
+    By default, also deletes the integration branch (it has been consumed by
+    `finalize` or is no longer needed). The feature branch itself is always
+    preserved — that is the user's commit they want to merge.
+    """
+    repo = p.root.parent
+    for agent_id in agent_ids(p):
         try:
-            agent = load_agent(repo, agent_id)
+            agent = load_agent(p, agent_id)
         except GitAgentError:
             continue
-        gitwrap.worktree_remove(agent.worktree, force=True, cwd=repo)
-        gitwrap.branch_delete(agent.branch, cwd=repo)
+        with contextlib.suppress(GitAgentError):
+            gitwrap.worktree_remove(agent.worktree, force=True, cwd=repo)
+            gitwrap.branch_delete(agent.branch, cwd=repo)
         gitwrap.worktree_prune(cwd=repo)
 
-    gitwrap.worktree_remove(session.integration_worktree, force=True, cwd=repo)
-    gitwrap.branch_delete(session.integration_branch, cwd=repo)
+    with contextlib.suppress(GitAgentError):
+        gitwrap.worktree_remove(session.integration_worktree, force=True, cwd=repo)
+    if delete_integration_branch:
+        with contextlib.suppress(GitAgentError):
+            gitwrap.branch_delete(session.integration_branch, cwd=repo)
     gitwrap.worktree_prune(cwd=repo)
 
-    p = paths(repo)
     for target in (p.agents, p.proposals, p.integration, p.locks):
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)

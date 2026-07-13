@@ -13,7 +13,9 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from . import agents as agents_mod
+from . import feature as feature_mod
 from . import finalize as finalize_mod
+from . import gitwrap, store
 from . import proposals as proposals_mod
 from . import review as review_mod
 from . import session as session_mod
@@ -48,6 +50,10 @@ def _print_json(obj: Any) -> None:
     sys.stdout.write(_json.dumps(obj, indent=2, sort_keys=True) + "\n")
 
 
+def _paths() -> store.Paths:
+    return store.current_feature_paths(gitwrap.resolve(None))
+
+
 # --- Session lifecycle -------------------------------------------------------
 
 
@@ -58,20 +64,25 @@ def init() -> None:
     session_mod.init()
     console.print(
         "[green]gitagent initialized.[/green] Run "
-        "[cyan]gitagent start --feature <name>[/cyan] to open a session."
+        f"[cyan]git checkout -b {feature_mod.FEATURE_PREFIX}<name>[/cyan] "
+        "and then [cyan]gitagent start[/cyan] to open a feature session."
     )
 
 
 @app.command()
 @_catch
-def start(
-    feature: str = typer.Option(..., "--feature", "-f", help="Feature name for the session."),
-) -> None:
-    """Open a new session anchored at the current HEAD."""
-    s = session_mod.start(feature=feature)
+def start() -> None:
+    """Open a session for the current feature branch (`ga/...`).
+
+    The feature name is derived from the branch. The branch must already
+    exist; create it with `git checkout -b ga/<name> main`. To work on
+    multiple features in parallel, use one branch per feature and switch
+    between them with `git checkout`.
+    """
+    s = session_mod.start()
     console.print(
         f"[green]Session[/green] [bold]{s.id}[/bold] [dim]({s.feature})[/dim] "
-        f"at {s.base_sha[:7]} on [cyan]{s.base_branch}[/cyan]."
+        f"at {s.base_sha[:7]} on [cyan]{s.branch}[/cyan]."
     )
 
 
@@ -80,14 +91,19 @@ def start(
 def status(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Show session, agents, proposals and integration state."""
+    """Show session, agents, proposals, integration state, and known features."""
     snap = session_mod.status_snapshot()
     if json_out:
         _print_json(snap)
         return
 
     if snap.get("session") is None:
-        console.print("[yellow]No active session.[/yellow] Run [cyan]gitagent start[/cyan].")
+        console.print(
+            f"[yellow]No active session on this branch "
+            f"({snap.get('branch') or 'detached'}).[/yellow] "
+            f"Run [cyan]gitagent start[/cyan] to open one."
+        )
+        _print_features_table(snap.get("features", []))
         return
 
     s = snap["session"]
@@ -95,7 +111,7 @@ def status(
         Panel.fit(
             f"Session [bold]{s['id']}[/bold]  [dim]{s['feature']}[/dim]\n"
             f"state: [cyan]{s['state']}[/cyan]   base: {s['base_sha'][:7]} "
-            f"on [cyan]{s['base_branch']}[/cyan]\n"
+            f"on [cyan]{s['branch']}[/cyan]\n"
             f"integration: {snap['integration']['integrated_count']} applied",
             title="gitagent status",
         )
@@ -132,13 +148,54 @@ def status(
     if proposals:
         console.print(pt)
 
+    _print_features_table(snap.get("features", []))
+
+
+def _print_features_table(features: list[dict[str, Any]]) -> None:
+    if not features:
+        return
+    ft = Table(title="Features in this repo", show_lines=False)
+    ft.add_column("branch", style="cyan")
+    ft.add_column("session", style="dim")
+    ft.add_column("state")
+    ft.add_column("agents", justify="right")
+    ft.add_column("proposals", justify="right")
+    for f in features:
+        ft.add_row(
+            f.get("branch", "?"),
+            f.get("session") or "-",
+            f.get("state", "-"),
+            str(f.get("agents", 0)),
+            str(f.get("proposals", 0)),
+        )
+    console.print(ft)
+
+
+@app.command(name="list-features")
+@_catch
+def list_features(
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """List all feature branches and their session state in this repo."""
+    repo = gitwrap.resolve(None)
+    store.require_init(repo)
+    items = session_mod.features_summary(repo)
+    if json_out:
+        _print_json(items)
+        return
+    if not items:
+        console.print("[dim]No features yet. Create one with "
+                      f"`git checkout -b {feature_mod.FEATURE_PREFIX}<name>`.[/dim]")
+        return
+    _print_features_table(items)
+
 
 @app.command()
 @_catch
 def log(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Show the audit trail (append-only log.jsonl)."""
+    """Show the audit trail (append-only log.jsonl; spans all features)."""
     entries = session_mod.log_entries()
     if json_out:
         _print_json(entries)
@@ -161,9 +218,15 @@ def log(
 @app.command()
 @_catch
 def abort() -> None:
-    """Discard everything: remove worktrees/branches and reset .gitagent state."""
+    """Discard the current feature's session: remove worktrees, reset .gitagent state.
+
+    The feature branch itself is preserved — that's the commit you want to merge.
+    """
     session_mod.abort()
-    console.print("[yellow]Session aborted.[/yellow] Worktrees removed, .gitagent reset.")
+    console.print(
+        "[yellow]Session aborted.[/yellow] Worktrees removed, .gitagent reset. "
+        "The feature branch is preserved; merge it manually with `git`."
+    )
 
 
 # --- Agents / isolation ------------------------------------------------------
@@ -176,7 +239,7 @@ def spawn(
     base: str = typer.Option(None, "--base", help="Base ref (default: session base SHA)."),
     role: str = typer.Option("", "--role", help="Role / task description."),
 ) -> None:
-    """Create an isolated worktree for a subagent."""
+    """Create an isolated worktree for a subagent on the current feature branch."""
     a = agents_mod.spawn(agent_id=id, base=base, role=role)
     console.print(
         f"[green]Agent[/green] [bold]{a.id}[/bold] -> [dim]{a.worktree}[/dim] "
@@ -189,7 +252,7 @@ def spawn(
 def list_agents(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """List agents in the active session."""
+    """List agents in the current feature's session."""
     items = agents_mod.list_agents()
     if json_out:
         _print_json(items)
@@ -362,7 +425,11 @@ def finalize(
         False, "--no-reset", help="Keep .gitagent state and worktrees after committing."
     ),
 ) -> None:
-    """Produce ONE commit on the current branch and reset .gitagent. Never pushes."""
+    """Produce ONE commit on the current feature branch and reset .gitagent. Never pushes.
+
+    The commit lands on the current branch (which must be `ga/...`). Merge the
+    feature branch into `main` with a normal PR or `git merge --squash`.
+    """
     sha = finalize_mod.finalize(message=message, sign=sign, no_reset=no_reset)
     console.print(
         f"[green]Finalized.[/green] Single commit [bold]{sha[:7]}[/bold] on current branch. "

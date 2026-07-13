@@ -30,6 +30,8 @@ class ProposalState(enum.StrEnum):
 class Session:
     id: str
     feature: str
+    feature_key: str
+    branch: str
     base_sha: str
     base_branch: str
     integration_branch: str
@@ -42,6 +44,8 @@ class Session:
         return {
             "id": self.id,
             "feature": self.feature,
+            "feature_key": self.feature_key,
+            "branch": self.branch,
             "base_sha": self.base_sha,
             "base_branch": self.base_branch,
             "integration_branch": self.integration_branch,
@@ -56,6 +60,8 @@ class Session:
         return cls(
             id=d["id"],
             feature=d["feature"],
+            feature_key=d.get("feature_key", d.get("feature", "")),
+            branch=d.get("branch", d.get("base_branch", "")),
             base_sha=d["base_sha"],
             base_branch=d["base_branch"],
             integration_branch=d["integration_branch"],

@@ -14,9 +14,16 @@ def finalize(
     sign: bool = False,
     no_reset: bool = False,
 ) -> str:
+    """Integrate accepted proposals and produce a single commit on the current branch.
+
+    The current branch must be a feature branch (`ga/...`). The commit lands on
+    that branch, NOT on `main` — the user merges the feature branch into `main`
+    with normal git (PR or `git merge --no-ff`) when ready.
+    """
     repo = gitwrap.resolve(repo)
     store.require_init(repo)
-    session = store.require_session(repo)
+    p = store.current_feature_paths(repo)
+    session = store.require_session(p)
     if session.state.value not in ("open", "integrating"):
         raise GitAgentError(f"Session is {session.state.value}; cannot finalize.")
 
@@ -24,8 +31,8 @@ def finalize(
 
     integrated = [
         pid
-        for pid in store.proposal_ids(repo)
-        if store.load_review(repo, pid).state == ProposalState.INTEGRATED
+        for pid in store.proposal_ids(p)
+        if store.load_review(p, pid).state == ProposalState.INTEGRATED
     ]
     if not integrated:
         raise GitAgentError(
@@ -36,9 +43,6 @@ def finalize(
     cur_branch = gitwrap.current_branch(repo)
     if cur_branch is None:
         raise GitAgentError("HEAD is detached; check out a branch before finalize.")
-    if cur_branch != session.base_branch:
-        # Proceed but warn: the squash will be a real 3-way merge and may conflict.
-        pass
 
     try:
         gitwrap.merge_squash(session.integration_branch, cwd=repo)
@@ -46,7 +50,7 @@ def finalize(
         gitwrap.abort_merge(cwd=repo)
         raise GitAgentError(
             f"Squash merge of integration into '{cur_branch}' conflicted. "
-            "Resolve manually in your working tree, or `gitagent abort` to discard.\n"
+            f"Resolve manually in your working tree, or `gitagent abort` to discard.\n"
             f"{exc}"
         ) from exc
 
@@ -57,9 +61,10 @@ def finalize(
 
     sha = gitwrap.commit(message, sign=sign, cwd=repo)
     store.log_event(
-        repo,
+        p,
         {
             "event": "finalize",
+            "feature_key": p.feature.name,
             "session": session.id,
             "commit": sha,
             "message": message,
@@ -68,6 +73,6 @@ def finalize(
     )
 
     if not no_reset:
-        store.teardown(repo, session, keep_log=True)
+        store.teardown(p, session, keep_log=True)
 
     return sha

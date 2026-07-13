@@ -12,7 +12,6 @@ def test_locate_returns_path() -> None:
     p = skill.locate()
     assert p is not None
     assert (p / "SKILL.md").exists()
-    assert (p / "AGENTS.md").exists()
 
 
 def test_install_copies_to_destination(tmp_path: Path) -> None:
@@ -20,7 +19,6 @@ def test_install_copies_to_destination(tmp_path: Path) -> None:
     result = skill.install(destination=dst)
     assert result == dst
     assert (dst / "SKILL.md").exists()
-    assert (dst / "AGENTS.md").exists()
     # content must be identical to the source
     src = skill.locate()
     assert src is not None
@@ -56,3 +54,15 @@ def test_install_overwrites_when_force_true(tmp_path: Path) -> None:
     assert result == dst
     assert (dst / "SKILL.md").exists()
     assert not (dst / "stale.txt").exists()
+
+
+def test_skill_is_a_single_file() -> None:
+    """The skill must live entirely in SKILL.md (opencode loads only that file).
+
+    AGENTS.md / README.md / examples / etc. are NOT loaded by opencode's skill
+    system; bundling them would mislead users into thinking they're read.
+    """
+    src = skill.locate()
+    assert src is not None
+    files = sorted(p.name for p in src.iterdir() if p.is_file())
+    assert files == ["SKILL.md"]

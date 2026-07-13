@@ -18,10 +18,11 @@ def propose(
     confidence: float | None = None,
 ) -> Proposal:
     repo = gitwrap.resolve(repo)
-    session = store.require_session(repo)
+    p = store.current_feature_paths(repo)
+    session = store.require_session(p)
     if session.state.value not in ("open", "integrating"):
         raise GitAgentError(f"Session is {session.state.value}; cannot propose.")
-    agent = store.load_agent(repo, agent_id)
+    agent = store.load_agent(p, agent_id)
     if agent.state != AgentState.ACTIVE:
         raise GitAgentError(f"Agent '{agent_id}' is {agent.state.value}; cannot propose.")
 
@@ -50,11 +51,11 @@ def propose(
         confidence=confidence,
         created_at=store.now(),
     )
-    store.save_proposal(repo, proposal)
-    store.patch_path(repo, pid).write_text(patch, encoding="utf-8")
-    store.save_review(repo, pid, Review(state=ProposalState.PENDING))
+    store.save_proposal(p, proposal)
+    store.patch_path(p, pid).write_text(patch, encoding="utf-8")
+    store.save_review(p, pid, Review(state=ProposalState.PENDING))
     store.log_event(
-        repo,
+        p,
         {
             "event": "propose",
             "proposal": pid,
@@ -68,12 +69,13 @@ def propose(
 
 def list_proposals(repo: Path | None = None) -> list[dict[str, Any]]:
     repo = gitwrap.resolve(repo)
-    store.require_session(repo)
+    p = store.current_feature_paths(repo)
+    store.require_session(p)
     out: list[dict[str, Any]] = []
-    for pid in store.proposal_ids(repo):
+    for pid in store.proposal_ids(p):
         try:
-            proposal = store.load_proposal(repo, pid)
-            review = store.load_review(repo, pid)
+            proposal = store.load_proposal(p, pid)
+            review = store.load_review(p, pid)
         except GitAgentError:
             continue
         out.append({"manifest": proposal.to_dict(), "review": review.to_dict()})
@@ -82,13 +84,15 @@ def list_proposals(repo: Path | None = None) -> list[dict[str, Any]]:
 
 def get(repo: Path | None = None, *, proposal_id: str) -> dict[str, Any]:
     repo = gitwrap.resolve(repo)
-    store.require_session(repo)
-    proposal = store.load_proposal(repo, proposal_id)
-    review = store.load_review(repo, proposal_id)
+    p = store.current_feature_paths(repo)
+    store.require_session(p)
+    proposal = store.load_proposal(p, proposal_id)
+    review = store.load_review(p, proposal_id)
     return {"manifest": proposal.to_dict(), "review": review.to_dict()}
 
 
 def read_patch(repo: Path | None = None, *, proposal_id: str) -> str:
     repo = gitwrap.resolve(repo)
-    store.require_session(repo)
-    return store.read_patch(repo, proposal_id)
+    p = store.current_feature_paths(repo)
+    store.require_session(p)
+    return store.read_patch(p, proposal_id)

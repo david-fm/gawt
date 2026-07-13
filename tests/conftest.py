@@ -27,12 +27,19 @@ def repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def started(repo: Path) -> Path:
+def feature_branch(repo: Path) -> Path:
+    """A repo checked out on a feature branch `ga/test-feature`."""
+    _git(["checkout", "-q", "-b", "ga/test-feature"], repo)
+    return repo
+
+
+@pytest.fixture
+def started(feature_branch: Path) -> Path:
     from gitagent import session
 
-    session.init(repo)
-    session.start(repo, feature="test-feature")
-    return repo
+    session.init(feature_branch)
+    session.start(feature_branch)
+    return feature_branch
 
 
 def write_and_commit(path: Path, content: str, msg: str, cwd: Path) -> None:
