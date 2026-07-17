@@ -43,9 +43,9 @@ def test_start_creates_session_and_integration_worktree(feature_branch: Path) ->
 
 
 def test_start_requires_feature_branch(repo: Path) -> None:
-    """Starting on 'main' (or any non-`ga/...` branch) must fail."""
+    """Starting on 'main' (or any non-`ga/...` branch) must fail without --feature."""
     session.init(repo)
-    with pytest.raises(GitAgentError, match="feature branch"):
+    with pytest.raises(GitAgentError, match="Could not determine"):
         session.start(repo)
 
 
@@ -92,46 +92,41 @@ def test_log_records_events(started: Path) -> None:
 
 
 def test_two_features_coexist(repo: Path) -> None:
-    """The headline feature: two feature branches hold their own sessions.
-
-    feature A and feature B can be developed in parallel; switching branches
-    reveals the right session.
-    """
+    """Two features finalized sequentially both land on main."""
     from gitagent import agents, proposals, review
     from gitagent import finalize as fin
 
     session.init(repo)
 
-    # Feature A
-    _git(["checkout", "-q", "-b", "ga/feature-a"], repo)
-    session.start(repo)
-    agents.spawn(repo, agent_id="a_a")
-    wt_a = Path(store.load_agent(store.paths(repo, "feature-a"), "a_a").worktree)
+    # Feature A — started via --feature (no manual checkout needed)
+    session.start(repo, feature_name="feature-a")
+    agents.spawn(repo, agent_id="a_a", feature="feature-a")
+    wt_a = Path(store.load_agent(store.paths_for_feature(repo, "feature-a"), "a_a").worktree)
     (wt_a / "a.txt").write_text("from feature a\n", encoding="utf-8")
-    p_a = proposals.propose(repo, agent_id="a_a", title="alpha")
-    review.accept(repo, proposal_id=p_a.id)
-    sha_a = fin.finalize(repo, message="feat(a): alpha")
-    assert gitwrap.current_branch(repo) == "ga/feature-a"
+    p_a = proposals.propose(repo, agent_id="a_a", title="alpha", feature="feature-a")
+    review.accept(repo, proposal_id=p_a.id, feature="feature-a")
+    sha_a = fin.finalize(repo, message="feat(a): alpha", feature="feature-a")
+    assert gitwrap.current_branch(repo) == "main"
 
-    # Feature B, in parallel (no need to switch first if user works on B now)
-    _git(["checkout", "-q", "-b", "ga/feature-b"], repo)
-    session.start(repo)
-    agents.spawn(repo, agent_id="b_b")
-    wt_b = Path(store.load_agent(store.paths(repo, "feature-b"), "b_b").worktree)
+    # Feature B — in parallel
+    session.start(repo, feature_name="feature-b")
+    agents.spawn(repo, agent_id="b_b", feature="feature-b")
+    wt_b = Path(store.load_agent(store.paths_for_feature(repo, "feature-b"), "b_b").worktree)
     (wt_b / "b.txt").write_text("from feature b\n", encoding="utf-8")
-    p_b = proposals.propose(repo, agent_id="b_b", title="beta")
-    review.accept(repo, proposal_id=p_b.id)
-    sha_b = fin.finalize(repo, message="feat(b): beta")
-    assert gitwrap.current_branch(repo) == "ga/feature-b"
+    p_b = proposals.propose(repo, agent_id="b_b", title="beta", feature="feature-b")
+    review.accept(repo, proposal_id=p_b.id, feature="feature-b")
+    sha_b = fin.finalize(repo, message="feat(b): beta", feature="feature-b")
+    assert gitwrap.current_branch(repo) == "main"
 
-    # Both feature branches hold their own commit
-    assert _git(["log", "-1", "--pretty=%H"], repo).strip() == sha_b
-    _git(["checkout", "-q", "ga/feature-a"], repo)
-    assert _git(["log", "-1", "--pretty=%H"], repo).strip() == sha_a
+    # Both commits are on main
+    subjects = _git(["log", "--pretty=%s"], repo).splitlines()
+    assert "feat(a): alpha" in subjects
+    assert "feat(b): beta" in subjects
+    assert (repo / "a.txt").read_text() == "from feature a\n"
+    assert (repo / "b.txt").read_text() == "from feature b\n"
 
-    # Both feature directories exist in .gitagent
-    assert "feature-a" in store.list_features(repo)
-    assert "feature-b" in store.list_features(repo)
+    # Feature directories cleaned up after finalize
+    assert store.list_features(repo) == []
 
 
 def test_list_features_command_shape(feature_branch: Path) -> None:

@@ -9,6 +9,15 @@ from .errors import GitAgentError
 from .models import AgentState, Proposal, ProposalState, Review
 
 
+def _resolve(repo: Path | None, feature: str | None = None) -> tuple[Path, store.Paths]:
+    repo = gitwrap.resolve(repo)
+    if feature is not None:
+        p = store.paths_for_feature(repo, feature)
+    else:
+        p = store.current_feature_paths(repo)
+    return repo, p
+
+
 def propose(
     repo: Path | None = None,
     *,
@@ -16,9 +25,9 @@ def propose(
     title: str,
     summary: str = "",
     confidence: float | None = None,
+    feature: str | None = None,
 ) -> Proposal:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+    repo, p = _resolve(repo, feature)
     session = store.require_session(p)
     if session.state.value not in ("open", "integrating"):
         raise GitAgentError(f"Session is {session.state.value}; cannot propose.")
@@ -67,9 +76,8 @@ def propose(
     return proposal
 
 
-def list_proposals(repo: Path | None = None) -> list[dict[str, Any]]:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+def list_proposals(repo: Path | None = None, *, feature: str | None = None) -> list[dict[str, Any]]:
+    repo, p = _resolve(repo, feature)
     store.require_session(p)
     out: list[dict[str, Any]] = []
     for pid in store.proposal_ids(p):
@@ -82,17 +90,25 @@ def list_proposals(repo: Path | None = None) -> list[dict[str, Any]]:
     return out
 
 
-def get(repo: Path | None = None, *, proposal_id: str) -> dict[str, Any]:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+def get(
+    repo: Path | None = None,
+    *,
+    proposal_id: str,
+    feature: str | None = None,
+) -> dict[str, Any]:
+    repo, p = _resolve(repo, feature)
     store.require_session(p)
     proposal = store.load_proposal(p, proposal_id)
     review = store.load_review(p, proposal_id)
     return {"manifest": proposal.to_dict(), "review": review.to_dict()}
 
 
-def read_patch(repo: Path | None = None, *, proposal_id: str) -> str:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+def read_patch(
+    repo: Path | None = None,
+    *,
+    proposal_id: str,
+    feature: str | None = None,
+) -> str:
+    repo, p = _resolve(repo, feature)
     store.require_session(p)
     return store.read_patch(p, proposal_id)

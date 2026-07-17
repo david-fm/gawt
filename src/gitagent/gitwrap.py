@@ -75,6 +75,15 @@ def worktree_add(
     run(["worktree", "add", "-b", branch, str(path), base_ref], cwd=cwd)
 
 
+def worktree_add_detached(
+    path: Path | str,
+    ref: str,
+    cwd: Path | str | None = None,
+) -> None:
+    """Create a detached worktree at *path* based on *ref* (branch or SHA)."""
+    run(["worktree", "add", "--detach", str(path), ref], cwd=cwd)
+
+
 def worktree_remove(
     path: Path | str, *, force: bool = False, cwd: Path | str | None = None
 ) -> None:
@@ -116,6 +125,16 @@ def merge_squash(branch: str, cwd: Path | str | None = None) -> None:
 def abort_merge(cwd: Path | str | None = None) -> None:
     with contextlib.suppress(GitAgentError):
         run(["merge", "--abort"], cwd=cwd)
+
+
+def reset_hard(sha: str, cwd: Path | str | None = None) -> None:
+    """Hard-reset HEAD to *sha* in the given working directory."""
+    run(["reset", "--hard", sha], cwd=cwd)
+
+
+def update_ref(ref: str, sha: str, cwd: Path | str | None = None) -> None:
+    """Update a symbolic ref (e.g. refs/heads/main) to point to *sha*."""
+    run(["update-ref", ref, sha], cwd=cwd)
 
 
 def unmerged_files(cwd: Path | str | None = None) -> list[str]:

@@ -28,6 +28,21 @@ def slugify(branch: str) -> str:
     return rest
 
 
+def coerce(name: str) -> str:
+    """Normalize a user-provided feature name into a safe key.
+
+    Accepts 'ga/foo', 'foo', 'ga/foo/bar', 'foo__bar'.
+    Always returns the bare name (no prefix): 'foo', 'foo/bar' (with '/' → '__').
+    """
+    if name.startswith(FEATURE_PREFIX):
+        name = name[len(FEATURE_PREFIX):]
+    name = name.replace("/", "__")
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", name)
+    if not name or name in (".", ".."):
+        raise GitAgentError(f"Feature name '{name}' is invalid.")
+    return name
+
+
 def is_feature_branch(branch: str | None) -> bool:
     return bool(branch) and branch.startswith(FEATURE_PREFIX)
 
@@ -38,3 +53,15 @@ def name_from_branch(branch: str) -> str:
     'ga/auth-rate-limiting' -> 'auth-rate-limiting'
     """
     return branch[len(FEATURE_PREFIX):]
+
+
+def branch_for_feature(name: str) -> str:
+    """Canonical feature branch name for a user-provided feature name.
+
+    'auth-rl'       -> 'ga/auth-rl'
+    'ga/auth-rl'    -> 'ga/auth-rl'
+    'foo/bar'       -> 'ga/foo__bar'
+    """
+    if name.startswith(FEATURE_PREFIX):
+        return name
+    return FEATURE_PREFIX + name.replace("__", "/")

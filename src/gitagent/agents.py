@@ -9,15 +9,24 @@ from .errors import GitAgentError
 from .models import Agent, AgentState
 
 
+def _resolve(repo: Path | None, feature: str | None = None) -> tuple[Path, store.Paths]:
+    repo = gitwrap.resolve(repo)
+    if feature is not None:
+        p = store.paths_for_feature(repo, feature)
+    else:
+        p = store.current_feature_paths(repo)
+    return repo, p
+
+
 def spawn(
     repo: Path | None = None,
     *,
     agent_id: str,
     base: str | None = None,
     role: str = "",
+    feature: str | None = None,
 ) -> Agent:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+    repo, p = _resolve(repo, feature)
     session = store.require_session(p)
     if session.state.value not in ("open", "integrating"):
         raise GitAgentError(f"Session is {session.state.value}; cannot spawn agents.")
@@ -57,9 +66,8 @@ def spawn(
     return agent
 
 
-def kill(repo: Path | None = None, *, agent_id: str) -> None:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+def kill(repo: Path | None = None, *, agent_id: str, feature: str | None = None) -> None:
+    repo, p = _resolve(repo, feature)
     store.require_session(p)
     agent = store.load_agent(p, agent_id)
     with contextlib.suppress(GitAgentError):
@@ -71,9 +79,8 @@ def kill(repo: Path | None = None, *, agent_id: str) -> None:
     store.log_event(p, {"event": "kill", "agent": agent_id})
 
 
-def list_agents(repo: Path | None = None) -> list[dict[str, Any]]:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+def list_agents(repo: Path | None = None, *, feature: str | None = None) -> list[dict[str, Any]]:
+    repo, p = _resolve(repo, feature)
     store.require_session(p)
     out: list[dict[str, Any]] = []
     for aid in store.agent_ids(p):

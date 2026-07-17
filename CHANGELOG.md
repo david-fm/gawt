@@ -7,8 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **Consolidated the bundled skill into a single `SKILL.md`**. The opencode skill system only reads `SKILL.md` (frontmatter + body); the previous companion `AGENTS.md` was never loaded. Removed `AGENTS.md` and merged its full content (roles, multi-feature loop, state machine, LLM JSON recipes, conflict recipes, subagent worktree how-to, concurrency, idempotency, mistakes, copy-paste recipes, programmatic use, on-disk layout, roadmap) into `SKILL.md` so the skill is self-contained.
+## [0.3.0] - 2026-07-17
+
+### Changed (BREAKING)
+- **`finalize` lands on `main` directly** (configurable via `--target`). The `ga/<feature>` branch is deleted after finalize (use `--keep-feature-branch` to preserve it). The user's local checkout is never disturbed — a detached temp worktree is used.
+- **`--feature` option on all commands**. Feature identity is decoupled from the current branch. Without `--feature`, the current branch is used as default with a deprecation warning. With `--feature`, any branch can remain checked out.
+- **`integrate` resets the integration worktree to the live target branch** before applying proposals. Cross-feature conflicts surface immediately via 3-way merge, not at merge-to-main time.
+- **`status` shows all features by default** (equivalent to `list-features`). With `--feature`, shows the detailed view for one feature.
+- **`Session` model gains `target_branch`** field (default: `"main"`).
+
+### Added
+- `feature.coerce()` and `feature.branch_for_feature()` for branch-name normalization without requiring a checkout.
+- `store.paths_for_feature(repo, name)` resolves paths by feature name, independent of the current branch.
+- `gitwrap.worktree_add_detached()` for creating detached temp worktrees.
+- `gitwrap.reset_hard()`, `gitwrap.update_ref()` for plumbing operations.
+- 8 new tests in `tests/test_multi_feature.py` covering branchless flow, cross-feature isolation, `--keep-feature-branch`, and the deprecation warning.
+
+### Migration from v0.2.0
+- `git checkout -b ga/x && gitagent start` → `gitagent start --feature x` (no checkout needed).
+- `gitagent finalize -m "..."` → `gitagent finalize --feature x -m "..."` (lands on main directly).
+- After finalize, no manual merge to main is needed — it's already on main.
+- `gitagent status` now shows all features. Use `--feature x` for the detail view.
+- The current branch is still accepted as a default for `--feature` (with a warning). Pass `--feature` explicitly to avoid the warning.
 
 ## [0.2.0] - 2026-07-13
 

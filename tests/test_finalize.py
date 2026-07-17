@@ -24,9 +24,10 @@ def _commit_count(repo: Path) -> int:
     return len(_git(["log", "--pretty=%H"], repo).splitlines())
 
 
-def test_finalize_produces_single_commit_on_feature_branch_and_resets(
+def test_finalize_produces_single_commit_on_main_and_resets(
     feature_branch: Path,
 ) -> None:
+    """New model: finalize lands on main (the target), not the feature branch."""
     session.init(feature_branch)
     session.start(feature_branch)
 
@@ -55,7 +56,8 @@ def test_finalize_produces_single_commit_on_feature_branch_and_resets(
         feature_branch, message="feat(auth): add rate limiting with tests"
     )
 
-    # exactly one new commit on the feature branch
+    # Exactly one new commit on main (the target)
+    assert gitwrap.current_branch(feature_branch) == "main"
     assert _commit_count(feature_branch) == before + 1
     assert (
         _git(["log", "-1", "--pretty=%s"], feature_branch).strip()
@@ -63,49 +65,33 @@ def test_finalize_produces_single_commit_on_feature_branch_and_resets(
     )
     assert gitwrap.current_sha(feature_branch) == sha
 
-    # files landed
+    # Files landed on main
     assert (feature_branch / "src" / "limiter.py").exists()
     assert (feature_branch / "tests" / "test_limiter.py").exists()
 
-    # session cleaned, integration branch removed
+    # Session cleaned, feature branch removed
     assert store.load_session(p) is None
-    s_log = next(
-        e for e in store.read_log(p)
-        if e.get("event") == "start"
-    )
-    assert not gitwrap.branch_exists(s_log.get("integration_branch", ""), feature_branch)
-    # feature branch is preserved
-    assert gitwrap.branch_exists("ga/test-feature", feature_branch)
+    assert not gitwrap.branch_exists("ga/test-feature", feature_branch)
 
     assert any(e.get("event") == "finalize" for e in store.read_log(p))
 
 
-def test_finalize_never_lands_on_main(repo: Path) -> None:
-    """Hard guarantee: if the user somehow starts a session on main (which
-    `start` would normally reject), `finalize` must error.
-    """
+def test_finalize_landing_on_main_is_allowed(repo: Path) -> None:
+    """In the new model, finalize lands on main by default."""
     session.init(repo)
-    # Bypass `start`'s check by injecting a session.json directly:
-    from gitagent import store as st
-    from gitagent.models import Session, SessionState
+    # main is a valid target — just need a feature branch for the session.
+    _git(["checkout", "-q", "-b", "ga/test-feature"], repo)
+    session.start(repo)
+    agents.spawn(repo, agent_id="a1")
+    p = store.paths(repo, "test-feature")
+    wt = Path(store.load_agent(p, "a1").worktree)
+    _edit(wt / "src", "x = 1\n")
+    p_obj = proposals.propose(repo, agent_id="a1", title="x")
+    review.accept(repo, proposal_id=p_obj.id)
 
-    p = st.paths(repo, "rogue")
-    p.feature.mkdir(parents=True, exist_ok=True)
-    s = Session(
-        id="s_rogue",
-        feature="rogue",
-        feature_key="rogue",
-        branch="main",
-        base_sha=gitwrap.current_sha(repo),
-        base_branch="main",
-        integration_branch="gitagent/integration/rogue/s_rogue",
-        integration_worktree=str(p.integration / "worktree"),
-        state=SessionState.OPEN,
-    )
-    st.save_session(p, s)
-    # Now `finalize` should refuse because `current_feature_paths` rejects main.
-    with pytest.raises(GitAgentError):
-        finalize.finalize(repo, message="should never happen")
+    sha = finalize.finalize(repo, message="feat: x")
+    assert gitwrap.current_branch(repo) == "main"
+    assert (repo / "src").exists()
 
 
 def test_finalize_with_no_proposals_fails(feature_branch: Path) -> None:
@@ -137,7 +123,8 @@ def test_finalize_with_only_pending_fails(feature_branch: Path) -> None:
         finalize.finalize(feature_branch, message="x")
 
 
-def test_finalize_no_reset_keeps_state(feature_branch: Path) -> None:
+def test_finalize_keep_feature_branch(feature_branch: Path) -> None:
+    """--keep-feature-branch preserves the ga/<feature> branch after finalize."""
     session.init(feature_branch)
     session.start(feature_branch)
     agents.spawn(feature_branch, agent_id="a1")
@@ -148,12 +135,17 @@ def test_finalize_no_reset_keeps_state(feature_branch: Path) -> None:
     review.accept(feature_branch, proposal_id=p_obj.id)
     review.integrate(feature_branch)
 
-    sha = finalize.finalize(feature_branch, message="feat: x", no_reset=True)
+    sha = finalize.finalize(
+        feature_branch, message="feat: x", keep_feature_branch=True,
+    )
 
+    # We're on main after finalize; the commit is on main.
+    assert gitwrap.current_branch(feature_branch) == "main"
     assert gitwrap.current_sha(feature_branch) == sha
-    assert store.load_session(p) is not None
-    s = store.load_session(p)
-    assert gitwrap.branch_exists(s.integration_branch, feature_branch)
+    # Feature branch preserved
+    assert gitwrap.branch_exists("ga/test-feature", feature_branch)
+    # But .gitagent/features/<key>/ is cleaned up
+    assert store.load_session(p) is None
 
 
 def test_conflict_is_marked_at_integrate_time(feature_branch: Path) -> None:
@@ -198,7 +190,5 @@ def test_abort_after_partial_work_cleans_everything(feature_branch: Path) -> Non
     session.abort(feature_branch)
 
     assert store.load_session(p) is None
-    # main + the initial readme = 1 commit, feature branch is preserved as
-    # a separate ref. We measure from the feature branch:
     assert _commit_count(feature_branch) == 1
     assert not (feature_branch / "src" / "x.py").exists()

@@ -5,10 +5,20 @@ from typing import Any
 
 from . import gitwrap, store
 from .errors import GitAgentError
-from .models import Proposal, ProposalState, Review, SessionState
+from .models import Proposal, ProposalState, Review, Session, SessionState
 
 
-def _apply(p: store.Paths, session, proposal: Proposal, review: Review) -> None:
+def _resolve(repo: Path | None, feature: str | None = None) -> tuple[Path, store.Paths, Session]:
+    repo = gitwrap.resolve(repo)
+    if feature is not None:
+        p = store.paths_for_feature(repo, feature)
+    else:
+        p = store.current_feature_paths(repo)
+    session = store.require_session(p)
+    return repo, p, session
+
+
+def _apply(p: store.Paths, session: Session, proposal: Proposal, review: Review) -> None:
     """Apply a proposal's patch onto the integration worktree and commit there.
 
     On success: state -> INTEGRATED, integrated=True.
@@ -51,6 +61,24 @@ def _apply(p: store.Paths, session, proposal: Proposal, review: Review) -> None:
     store.save_review(p, proposal.id, review)
 
 
+def _reset_integration_to_target(session: Session, *, repo: Path) -> None:
+    """Hard-reset the integration worktree to the current target branch HEAD.
+
+    This discards any prior integration work (idempotent re-integrate model)
+    so that proposals are always applied against the *live* target state.
+    Cross-feature conflicts surface as 3-way merge failures during _apply.
+
+    The target SHA is resolved from the main *repo* (not the worktree),
+    because the worktree is on its own branch and may not have local refs
+    for the target.
+    """
+    int_wt = Path(session.integration_worktree)
+    # Resolve target SHA from the main repo, not the worktree.
+    target_sha = gitwrap.run(["rev-parse", session.target_branch], cwd=repo).strip()
+    # Run reset inside the integration worktree.
+    gitwrap.run(["reset", "--hard", target_sha], cwd=int_wt)
+
+
 def _can_accept(review: Review) -> tuple[bool, str]:
     if review.state == ProposalState.PENDING:
         return True, ""
@@ -67,10 +95,8 @@ def _can_accept(review: Review) -> tuple[bool, str]:
     return False, f"state is '{review.state.value}'"
 
 
-def accept(repo: Path | None = None, *, proposal_id: str) -> Review:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
-    session = store.require_session(p)
+def accept(repo: Path | None = None, *, proposal_id: str, feature: str | None = None) -> Review:
+    repo, p, session = _resolve(repo, feature)
     if session.state.value not in ("open", "integrating"):
         raise GitAgentError(f"Session is {session.state.value}; cannot accept.")
     store.load_proposal(p, proposal_id)
@@ -101,9 +127,14 @@ def _can_reject(review: Review) -> tuple[bool, str]:
     return True, ""
 
 
-def reject(repo: Path | None = None, *, proposal_id: str, reason: str = "") -> Review:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+def reject(
+    repo: Path | None = None,
+    *,
+    proposal_id: str,
+    reason: str = "",
+    feature: str | None = None,
+) -> Review:
+    repo, p, session = _resolve(repo, feature)
     store.require_session(p)
     store.load_proposal(p, proposal_id)
 
@@ -132,10 +163,13 @@ def _can_revise(review: Review) -> tuple[bool, str]:
 
 
 def revise(
-    repo: Path | None = None, *, proposal_id: str, feedback: str = ""
+    repo: Path | None = None,
+    *,
+    proposal_id: str,
+    feedback: str = "",
+    feature: str | None = None,
 ) -> Review:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
+    repo, p, session = _resolve(repo, feature)
     store.require_session(p)
     store.load_proposal(p, proposal_id)
 
@@ -156,26 +190,49 @@ def revise(
     return review
 
 
-def integrate(repo: Path | None = None) -> dict[str, Any]:
-    repo = gitwrap.resolve(repo)
-    p = store.current_feature_paths(repo)
-    session = store.require_session(p)
+def integrate(repo: Path | None = None, *, feature: str | None = None) -> dict[str, Any]:
+    """Apply all accepted proposals onto the integration branch; detect conflicts.
+
+    The integration worktree is reset to the current state of the target
+    branch (e.g. ``main``) before applying, so cross-feature conflicts are
+    surfaced immediately via 3-way merge.
+    """
+    repo, p, session = _resolve(repo, feature)
     if session.state.value not in ("open", "integrating"):
         raise GitAgentError(f"Session is {session.state.value}; cannot integrate.")
 
     session.state = SessionState.INTEGRATING
     store.save_session(p, session)
 
-    applied: list[str] = []
-    conflicted: list[str] = []
-    skipped: list[str] = []
-
+    # Pre-scan: determine which proposals need application.
     items: list[tuple[str, str, Proposal, Review]] = []
     for pid in store.proposal_ids(p):
         proposal = store.load_proposal(p, pid)
         review = store.load_review(p, pid)
         items.append((proposal.created_at, pid, proposal, review))
     items.sort(key=lambda x: (x[0], x[1]))
+
+    needs_apply = [
+        (pid, pr, rv)
+        for _, pid, pr, rv in items
+        if rv.state in (ProposalState.ACCEPTED, ProposalState.CONFLICT)
+    ]
+
+    # --- Phase 4: reset integration worktree to live target state --------
+    # Only reset when there are proposals to apply (avoids empty resets
+    # when finalize calls integrate on already-integrated proposals).
+    if needs_apply:
+        try:
+            _reset_integration_to_target(session, repo=repo)
+        except GitAgentError as exc:
+            raise GitAgentError(
+                f"Failed to reset integration worktree to target '{session.target_branch}'. "
+                f"Does that branch exist?\n{exc}"
+            ) from exc
+
+    applied: list[str] = []
+    conflicted: list[str] = []
+    skipped: list[str] = []
 
     with store.lock(p, "integration"):
         for _, pid, proposal, review in items:

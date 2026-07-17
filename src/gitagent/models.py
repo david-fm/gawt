@@ -36,6 +36,7 @@ class Session:
     base_branch: str
     integration_branch: str
     integration_worktree: str
+    target_branch: str = "main"
     state: SessionState = SessionState.OPEN
     created_at: str = ""
     updated_at: str = ""
@@ -50,6 +51,7 @@ class Session:
             "base_branch": self.base_branch,
             "integration_branch": self.integration_branch,
             "integration_worktree": self.integration_worktree,
+            "target_branch": self.target_branch,
             "state": self.state.value,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -66,6 +68,7 @@ class Session:
             base_branch=d["base_branch"],
             integration_branch=d["integration_branch"],
             integration_worktree=d["integration_worktree"],
+            target_branch=d.get("target_branch", "main"),
             state=SessionState(d.get("state", "open")),
             created_at=d.get("created_at", ""),
             updated_at=d.get("updated_at", ""),

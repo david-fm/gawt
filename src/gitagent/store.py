@@ -91,11 +91,27 @@ def list_features(repo: Path) -> list[str]:
     return sorted(p.name for p in d.iterdir() if p.is_dir())
 
 
-def current_feature_paths(repo: Path) -> Paths:
-    """Resolve paths for the active feature, based on the current git branch.
+def paths_for_feature(repo: Path, feature_name: str) -> Paths:
+    """Resolve paths for a feature by name, regardless of the current branch.
 
-    The branch must be a feature branch (prefix `ga/`). The feature key is
-    derived from the branch name.
+    Accepts 'daily-env-netcdf' or 'ga/daily-env-netcdf' — both resolve to the
+    same directory under .gitagent/features/<key>/.
+    """
+    require_init(repo)
+    key = feature.coerce(feature_name)
+    return paths(repo, key)
+
+
+def current_feature_paths(repo: Path) -> Paths:
+    """Resolve paths for the active feature based on the current git branch.
+
+    The branch must be a feature branch (prefix ``ga/``).  Returns
+    ``paths_for_feature`` once the branch is resolved.
+
+    .. deprecated::
+        Prefer ``paths_for_feature`` with an explicit feature name.  The
+        current-branch fallback is kept for backward compatibility and will
+        emit a warning when the branch is not ``ga/<feature>``.
     """
     require_init(repo)
     branch = gitwrap.current_branch(repo)
@@ -104,10 +120,10 @@ def current_feature_paths(repo: Path) -> Paths:
     if not feature.is_feature_branch(branch):
         raise GitAgentError(
             f"Current branch '{branch}' is not a feature branch. "
-            f"Run `git checkout -b {feature.FEATURE_PREFIX}<name>` to create one. "
-            f"`finalize` never lands on 'main' or 'master'."
+            f"Run `git checkout -b {feature.FEATURE_PREFIX}<name>` to create one, "
+            f"or pass --feature <name> to specify the feature explicitly."
         )
-    return paths(repo, feature.slugify(branch))
+    return paths_for_feature(repo, branch)
 
 
 def ensure_dirs(p: Paths) -> None:
@@ -126,6 +142,12 @@ def require_session(p: Paths) -> Session:
     if s is None:
         raise GitAgentError("No active session for this feature. Run `gitagent start` first.")
     return s
+
+
+def require_session_for(repo: Path, feature_name: str) -> Session:
+    """Load a session by feature name (not branch-dependent)."""
+    p = paths_for_feature(repo, feature_name)
+    return require_session(p)
 
 
 def save_session(p: Paths, session: Session) -> None:

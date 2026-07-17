@@ -1,11 +1,13 @@
 ---
 name: gitagent
-description: Use this skill when you (or another agent you supervise) need to coordinate multi-agent coding work over Git — spawning isolated subagent worktrees per feature branch, collecting proposals as patches, accepting/rejecting/revising them, and producing one clean commit per feature branch. Triggers on "gitagent", "agent worktree", "multi-agent git workflow", "isolate subagent work", "consolidate agent changes into one commit", "spawn an agent for X", "review proposal", "agent proposal", "multi-feature", "parallel features". Do NOT use for: general git questions (use regular git), single-developer workflows, or non-agent coordination tasks.
+description: Use this skill when you (or another agent you supervise) need to coordinate multi-agent coding work over Git — spawning isolated subagent worktrees per feature, collecting proposals as patches, accepting/rejecting/revising them, and producing one clean commit on main. Triggers on "gitagent", "agent worktree", "multi-agent git workflow", "isolate subagent work", "consolidate agent changes into one commit", "spawn an agent for X", "review proposal", "agent proposal", "multi-feature", "parallel features". Do NOT use for: general git questions (use regular git), single-developer workflows, or non-agent coordination tasks.
 ---
 
 # gitagent
 
-A CLI for coordinating **multiple AI subagents** working in the same Git repository, on **multiple feature branches in parallel**. Each feature gets a `ga/<name>` branch with its own session, subagent worktrees, proposals, and integration branch. You (the superagent) collect subagent work as **proposals** (patches + manifests), review them, and finalize each feature as **one commit** on its own branch. You then merge feature branches into `main` with normal git. `gitagent` never pushes.
+A CLI for coordinating **multiple AI subagents** working in the same Git repository, on **multiple features in parallel**. Each feature gets its own session, subagent worktrees, proposals, and integration branch. You (the superagent) collect subagent work as **proposals** (patches + manifests), review them, and finalize each feature as **one commit on `main`**. `gitagent` never pushes.
+
+**Branchless workflow**: all commands accept `--feature <name>`. Your local checkout is never disturbed.
 
 > Two planes: `.git` (real history, untouched until `finalize`) and `.gitagent/` (ephemeral coordination — one subdirectory per feature, plus a global audit log).
 
@@ -19,14 +21,14 @@ This document is the **complete skill** — frontmatter loads it, and it contain
 
 ### 1.1 Supervisor (superagent) — the orchestrator
 
-Owns **all** active sessions — one per feature branch — and the final commit per feature. Lands features on `main` with normal git.
+Owns **all** active sessions — one per feature — and the final commit per feature. Lands features on `main` directly.
 
 **Responsibilities:**
 - `init` once per repo
-- For each feature: create the `ga/<name>` branch, `start` the session, `spawn` subagents, review, decide, `finalize`
+- For each feature: `start --feature <name>`, `spawn` subagents, review, decide, `finalize`
 - Run `list-features` to see all in-flight features
-- Switch branches (`git checkout ga/<other>`) to operate on a different feature
-- After all features are finalized: `git checkout main && git merge --squash ga/<x> && git commit -m "..."` (one commit per feature, or via PR)
+- `status --feature <name>` to see detail for one feature
+- `finalize --feature <name> -m "..."` lands on main directly (no manual merge needed)
 
 **Mindset:** the integration branch is yours per feature. Subagents never see it; they only see their own worktree and your `feedback` strings. The `main` branch is **never** touched by `gitagent`.
 
@@ -58,28 +60,29 @@ Optional role. Examines proposals and recommends accept/reject/revise to the sup
 
 ## 2. The multi-feature model
 
-**The single rule:** a feature is a git branch whose name starts with `ga/`. The current branch determines the active session. Switch branches to switch sessions. Two features in two branches run in parallel without colliding.
+**The single rule:** a feature is identified by `--feature <name>`. The `ga/<name>` branch is internal — created at `start`, deleted at `finalize`. Your local checkout is never disturbed.
 
 ```bash
-# Set up two features in parallel
-git checkout -b ga/auth-rate-limiting main
-gitagent start
-gitagent spawn --id a_backend
-# ... work, propose, accept, finalize ...
+gitagent init
 
-git checkout main
-git checkout -b ga/user-profile main
-gitagent start
-gitagent spawn --id a_frontend
+# Feature A: auth rate limiting (no checkout needed)
+gitagent start --feature auth-rate-limiting
+gitagent spawn --feature auth-rate-limiting --id a_backend
 # ... work, propose, accept, finalize ...
+gitagent finalize --feature auth-rate-limiting -m "feat(auth): rate limiting"
+# → 1 commit on main
 
-# Land on main (plain git; gitagent never does this)
-git checkout main
-git merge --squash ga/auth-rate-limiting && git commit -m "feat(auth): rate limiting"
-git merge --squash ga/user-profile      && git commit -m "feat(user): profile page"
+# Feature B: user profile (parallel)
+gitagent start --feature user-profile
+gitagent spawn --feature user-profile --id a_frontend
+# ... work, propose, accept, finalize ...
+gitagent finalize --feature user-profile -m "feat(user): profile page"
+# → 1 commit on main
+
+# Both commits are on main. No git merge needed.
 ```
 
-`gitagent start` **refuses to run on `main`** — it requires a `ga/<name>` branch. To re-enter a feature, `git checkout ga/<name>` and run `start` again (a fresh session is opened; the audit log is preserved).
+Without `--feature`, the current branch is used as default (with a deprecation warning). Pass `--feature` explicitly to avoid the checkout dance.
 
 **What's isolated per feature:**
 - session.json (different `s_<hex>` ids)
@@ -93,7 +96,7 @@ git merge --squash ga/user-profile      && git commit -m "feat(user): profile pa
 - The audit log (`.gitagent/log.jsonl`) — events for *all* features are interleaved. Use the `feature_key` field to filter.
 
 **What the supervisor does NOT do via gitagent:**
-- `git checkout main` and `git merge --squash ga/<x>`. Use plain git, PRs, or whatever your team uses for landing.
+- `git checkout` to switch features. All operations target features by name.
 
 ---
 
@@ -134,33 +137,33 @@ The CLI cleanly separates **deciding** from **applying**:
 ```bash
 gitagent init                                # one-time per repo
 
-# On a feature branch (create with `git checkout -b ga/<name> main`)
-gitagent start                               # open a session for the current feature
+gitagent start --feature <name>              # open a session for a feature
 
-gitagent spawn --id <agent-id> [--role "..."] [--base <ref>]
-gitagent list-agents                         # --json available
-gitagent kill <agent-id>
+gitagent spawn --feature <name> --id <agent-id> [--role "..."] [--base <ref>]
+gitagent list-agents --feature <name>        # --json available
+gitagent kill <agent-id> --feature <name>
 
 # inside an agent's worktree, the subagent does its work, then:
-gitagent propose --agent <id> --title "..." [--summary "..."] [--confidence 0.8]
+gitagent propose --feature <name> --agent <id> --title "..." [--summary "..."] [--confidence 0.8]
 
-gitagent proposals                           # --json available
-gitagent show <pid>                          # colored diff (human)
-gitagent diff <pid>                          # raw diff (pipe to LLM / apply)
-gitagent status                              # --json available
+gitagent proposals --feature <name>          # --json available
+gitagent show <pid> --feature <name>         # colored diff (human)
+gitagent diff <pid> --feature <name>         # raw diff (pipe to LLM / apply)
+gitagent status                              # --json available (all features)
+gitagent status --feature <name>             # detail view for one feature
 gitagent list-features                       # --json available (all features in the repo)
 gitagent log                                 # --json available (audit trail; global, all features)
 
 # superagent decisions (mark only — no apply):
-gitagent accept <pid>
-gitagent reject <pid> [--reason "..."]
-gitagent revise <pid> --feedback "..."
+gitagent accept <pid> --feature <name>
+gitagent reject <pid> --feature <name> [--reason "..."]
+gitagent revise <pid> --feature <name> --feedback "..."
 
-# application step (apply all accepted; surfaces conflicts):
-gitagent integrate                           # --json available
+# application step (apply all accepted; resets to live target, surfaces cross-feature conflicts):
+gitagent integrate --feature <name>          # --json available
 
-# single commit on the current feature branch, then reset .gitagent:
-gitagent finalize --message "<msg>" [--sign] [--no-reset]
+# single commit on the target branch (default: main), then reset .gitagent:
+gitagent finalize --feature <name> --message "<msg>" [--target main] [--keep-feature-branch] [--sign]
 ```
 
 ---
@@ -244,9 +247,9 @@ feature branch`, run `git checkout -b ga/<name> main` first.
 4. **`diff <pid>` is pipe-friendly** — it's a raw `git diff` patch. Use it to feed another LLM, to `git apply` manually, or to inspect.
 5. **Conflicts don't kill the session.** A `conflict` proposal means "this patch didn't apply cleanly to current integration". Use `revise` to send it back, or fix the integration worktree manually and re-`accept` then re-`integrate`.
 6. **Integration order = proposal creation order.** The first agent to `propose` integrates first. Plan who proposes first if their change is the "base" others depend on.
-7. **`abort` is destructive** — it removes all agent worktrees, branches, and the feature's `.gitagent/` state (keeping the audit log and the feature branch). Use it when you want to start over on a feature.
-8. **The current branch determines the session.** To work on a different feature, `git checkout` its `ga/...` branch. The active session is always on the current branch — there is no `--feature` flag.
-9. **Never `finalize` on `main` (or `master`).** `start` refuses to open a session on a non-`ga/...` branch, so this is enforced upstream — but if you see a stray finalize on main, that's a bug, not a feature.
+7. **`abort` is destructive** — it removes all agent worktrees, branches, and the feature's `.gitagent/` state (keeping the audit log). Use it when you want to start over on a feature.
+8. **`--feature` is the session selector.** All commands that operate on a feature accept `--feature <name>`. Without it, the current branch is used as default (with a deprecation warning). Pass `--feature` explicitly to avoid the checkout dance.
+9. **`finalize` lands on `main` directly** (configurable via `--target`). Uses a detached temp worktree. The user's checkout is never disturbed. The `ga/<feature>` branch is deleted (use `--keep-feature-branch` to preserve it).
 
 ---
 
