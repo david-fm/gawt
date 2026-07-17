@@ -105,7 +105,7 @@ def test_two_features_coexist(repo: Path) -> None:
     (wt_a / "a.txt").write_text("from feature a\n", encoding="utf-8")
     p_a = proposals.propose(repo, agent_id="a_a", title="alpha", feature="feature-a")
     review.accept(repo, proposal_id=p_a.id, feature="feature-a")
-    sha_a = fin.finalize(repo, message="feat(a): alpha", feature="feature-a")
+    fin.finalize(repo, message="feat(a): alpha", feature="feature-a")
     assert gitwrap.current_branch(repo) == "main"
 
     # Feature B — in parallel
@@ -115,7 +115,7 @@ def test_two_features_coexist(repo: Path) -> None:
     (wt_b / "b.txt").write_text("from feature b\n", encoding="utf-8")
     p_b = proposals.propose(repo, agent_id="b_b", title="beta", feature="feature-b")
     review.accept(repo, proposal_id=p_b.id, feature="feature-b")
-    sha_b = fin.finalize(repo, message="feat(b): beta", feature="feature-b")
+    fin.finalize(repo, message="feat(b): beta", feature="feature-b")
     assert gitwrap.current_branch(repo) == "main"
 
     # Both commits are on main

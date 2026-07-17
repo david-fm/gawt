@@ -39,7 +39,7 @@ def repo_with_two_finalized_features(tmp_path: Path) -> Path:
     session.init(r)
 
     # Feature A: started from main via --feature flag (no git checkout)
-    s_a = session.start(r, feature_name="feature-a")
+    session.start(r, feature_name="feature-a")
     agents.spawn(r, agent_id="a_a", feature="feature-a")
     p_a = store.paths_for_feature(r, "feature-a")
     wt_a = Path(store.load_agent(p_a, "a_a").worktree)
@@ -49,7 +49,7 @@ def repo_with_two_finalized_features(tmp_path: Path) -> Path:
     finalize.finalize(r, message="feat(a): alpha", feature="feature-a")
 
     # Feature B: started from main via --feature flag (no git checkout)
-    s_b = session.start(r, feature_name="feature-b")
+    session.start(r, feature_name="feature-b")
     agents.spawn(r, agent_id="b_b", feature="feature-b")
     p_b = store.paths_for_feature(r, "feature-b")
     wt_b = Path(store.load_agent(p_b, "b_b").worktree)
@@ -172,7 +172,7 @@ def test_finalize_with_keep_feature_branch(tmp_path: Path) -> None:
     _git(["commit", "-qm", "initial"], r)
     session.init(r)
 
-    s = session.start(r, feature_name="my-feat")
+    session.start(r, feature_name="my-feat")
     agents.spawn(r, agent_id="agent1", feature="my-feat")
     p = store.paths_for_feature(r, "my-feat")
     wt = Path(store.load_agent(p, "agent1").worktree)

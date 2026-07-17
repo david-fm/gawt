@@ -89,7 +89,7 @@ def test_finalize_landing_on_main_is_allowed(repo: Path) -> None:
     p_obj = proposals.propose(repo, agent_id="a1", title="x")
     review.accept(repo, proposal_id=p_obj.id)
 
-    sha = finalize.finalize(repo, message="feat: x")
+    finalize.finalize(repo, message="feat: x")
     assert gitwrap.current_branch(repo) == "main"
     assert (repo / "src").exists()
 
