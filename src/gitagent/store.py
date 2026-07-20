@@ -103,27 +103,17 @@ def paths_for_feature(repo: Path, feature_name: str) -> Paths:
 
 
 def current_feature_paths(repo: Path) -> Paths:
-    """Resolve paths for the active feature based on the current git branch.
+    """Resolve paths for the active feature.
 
-    The branch must be a feature branch (prefix ``ga/``).  Returns
-    ``paths_for_feature`` once the branch is resolved.
-
-    .. deprecated::
-        Prefer ``paths_for_feature`` with an explicit feature name.  The
-        current-branch fallback is kept for backward compatibility and will
-        emit a warning when the branch is not ``ga/<feature>``.
+    gitagent is fully decoupled from the user's branches, so the feature must
+    be specified explicitly.  This helper is retained for internal callers
+    that already resolved a feature name; new code should call
+    ``paths_for_feature`` directly with ``--feature``.
     """
-    require_init(repo)
-    branch = gitwrap.current_branch(repo)
-    if branch is None:
-        raise GitAgentError("HEAD is detached. Check out a feature branch to operate.")
-    if not feature.is_feature_branch(branch):
-        raise GitAgentError(
-            f"Current branch '{branch}' is not a feature branch. "
-            f"Run `git checkout -b {feature.FEATURE_PREFIX}<name>` to create one, "
-            f"or pass --feature <name> to specify the feature explicitly."
-        )
-    return paths_for_feature(repo, branch)
+    raise GitAgentError(
+        "A feature name is required.  Pass --feature <name> explicitly; "
+        "gitagent no longer infers features from the current branch."
+    )
 
 
 def ensure_dirs(p: Paths) -> None:
@@ -262,14 +252,13 @@ def teardown(
     session: Session,
     *,
     keep_log: bool = True,
-    delete_integration_branch: bool = True,
 ) -> None:
     """Reset a single feature's state.
 
-    Removes all agent worktrees/ephemeral branches and the integration worktree.
-    By default, also deletes the integration branch (it has been consumed by
-    `finalize` or is no longer needed). The feature branch itself is always
-    preserved — that is the user's commit they want to merge.
+    Removes all agent worktrees and the integration worktree.  gitagent never
+    created branches in the user's repository (agents and integration work in
+    detached worktrees), so there are no branches to delete here.  The target
+    branch is only ever written by `finalize`.
     """
     repo = p.root.parent
     for agent_id in agent_ids(p):
@@ -279,14 +268,10 @@ def teardown(
             continue
         with contextlib.suppress(GitAgentError):
             gitwrap.worktree_remove(agent.worktree, force=True, cwd=repo)
-            gitwrap.branch_delete(agent.branch, cwd=repo)
         gitwrap.worktree_prune(cwd=repo)
 
     with contextlib.suppress(GitAgentError):
         gitwrap.worktree_remove(session.integration_worktree, force=True, cwd=repo)
-    if delete_integration_branch:
-        with contextlib.suppress(GitAgentError):
-            gitwrap.branch_delete(session.integration_branch, cwd=repo)
     gitwrap.worktree_prune(cwd=repo)
 
     for target in (p.agents, p.proposals, p.integration, p.locks):

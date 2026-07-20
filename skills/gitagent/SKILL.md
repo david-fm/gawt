@@ -5,9 +5,9 @@ description: Use this skill when you (or another agent you supervise) need to co
 
 # gitagent
 
-A CLI for coordinating **multiple AI subagents** working in the same Git repository, on **multiple features in parallel**. Each feature gets its own session, subagent worktrees, proposals, and integration branch. You (the superagent) collect subagent work as **proposals** (patches + manifests), review them, and finalize each feature as **one commit on `main`**. `gitagent` never pushes.
+A CLI for coordinating **multiple AI subagents** working in the same Git repository, on **multiple features in parallel**. Each feature gets its own session, subagent worktrees, proposals, and integration worktree. You (the superagent) collect subagent work as **proposals** (patches + manifests), review them, and finalize each feature as **one commit on `main`**. `gitagent` never pushes.
 
-**Branchless workflow**: all commands accept `--feature <name>`. Your local checkout is never disturbed.
+**Decoupled from your git branches**: every command requires `--feature <name>` (a logical key, not a git branch). gitagent never creates or switches branches in your repository — agents, integration and proposals all live in detached worktrees. Your local checkout stays on `main` throughout.
 
 > Two planes: `.git` (real history, untouched until `finalize`) and `.gitagent/` (ephemeral coordination — one subdirectory per feature, plus a global audit log).
 
@@ -30,7 +30,7 @@ Owns **all** active sessions — one per feature — and the final commit per fe
 - `status --feature <name>` to see detail for one feature
 - `finalize --feature <name> -m "..."` lands on main directly (no manual merge needed)
 
-**Mindset:** the integration branch is yours per feature. Subagents never see it; they only see their own worktree and your `feedback` strings. The `main` branch is **never** touched by `gitagent`.
+**Mindset:** the integration worktree is yours per feature. Subagents never see it; they only see their own worktree and your `feedback` strings. The `main` branch is **never** touched by `gitagent` until `finalize`.
 
 ### 1.2 Coder (subagent) — the implementer
 
@@ -60,7 +60,7 @@ Optional role. Examines proposals and recommends accept/reject/revise to the sup
 
 ## 2. The multi-feature model
 
-**The single rule:** a feature is identified by `--feature <name>`. The `ga/<name>` branch is internal — created at `start`, deleted at `finalize`. Your local checkout is never disturbed.
+**The single rule:** a feature is identified by `--feature <name>` (a logical key, never a git branch). gitagent never creates a `ga/<name>` branch — all work is done in detached worktrees. Your local checkout is never disturbed and stays on `main`.
 
 ```bash
 gitagent init
@@ -82,7 +82,7 @@ gitagent finalize --feature user-profile -m "feat(user): profile page"
 # Both commits are on main. No git merge needed.
 ```
 
-Without `--feature`, the current branch is used as default (with a deprecation warning). Pass `--feature` explicitly to avoid the checkout dance.
+`--feature` is **required** on every command. There is no default branch inference. Pass it explicitly.
 
 **What's isolated per feature:**
 - session.json (different `s_<hex>` ids)
@@ -109,8 +109,8 @@ The CLI cleanly separates **deciding** from **applying**:
 | `accept <pid>` | Record the decision "this proposal is approved". Does **not** apply. |
 | `reject <pid>` | Record "this proposal is rejected". |
 | `revise <pid>` | Send back to the agent for another iteration (new `pid` on re-propose). |
-| `integrate` | **Apply** all accepted proposals onto the integration branch (in creation order). Detects conflicts. |
-| `finalize` | Calls `integrate` (if needed) + creates **one** commit on the current feature branch. |
+| `integrate` | **Apply** all accepted proposals onto the integration worktree (in creation order). Detects conflicts. |
+| `finalize` | Calls `integrate` (if needed) + creates **one** commit on the target branch (`main`). |
 
 `finalize` calls `integrate` internally, so a minimal flow is: `accept` each → `finalize`. Run `integrate` explicitly when you want to see conflicts before committing.
 
@@ -163,7 +163,7 @@ gitagent revise <pid> --feature <name> --feedback "..."
 gitagent integrate --feature <name>          # --json available
 
 # single commit on the target branch (default: main), then reset .gitagent:
-gitagent finalize --feature <name> --message "<msg>" [--target main] [--keep-feature-branch] [--sign]
+gitagent finalize --feature <name> --message "<msg>" [--target main] [--sign]
 ```
 
 ---
@@ -174,26 +174,25 @@ gitagent finalize --feature <name> --message "<msg>" [--target main] [--keep-fea
 SUPERVISOR                          SUBAGENT
 ─────────                           ────────
 gitagent init
-git checkout -b ga/auth-rl main
-gitagent start
-gitagent spawn --id a_backend  ───▶ "implement X in your worktree"
+gitagent start --feature auth-rl
+gitagent spawn --feature auth-rl --id a_backend  ───▶ "implement X in your worktree"
                                     ... implement in worktree ...
-                                    gitagent propose --agent a_backend \
+                                    gitagent propose --feature auth-rl --agent a_backend \
                                        --title "..." --confidence 0.8
-gitagent proposals
-gitagent show <pid>
-gitagent accept <pid>              (or revise/reject)   ← decision only
+gitagent proposals --feature auth-rl
+gitagent show <pid> --feature auth-rl
+gitagent accept <pid> --feature auth-rl              (or revise/reject)   ← decision only
                                     ... if revise: iterate, re-propose ...
-gitagent spawn --id a_tests    ───▶ "write tests for X"
+gitagent spawn --feature auth-rl --id a_tests    ───▶ "write tests for X"
                                     ... write tests ...
-                                    gitagent propose --agent a_tests ...
-gitagent accept <pid>              ← decision only
+                                    gitagent propose --feature auth-rl --agent a_tests ...
+gitagent accept <pid> --feature auth-rl              ← decision only
 
 # OPTIONAL: apply now to see conflicts early
-gitagent integrate                 ← applies all accepted in creation order
+gitagent integrate --feature auth-rl                 ← applies all accepted in creation order
 
-gitagent finalize -m "feat: X"     ← applies again if needed, then 1 commit
-# 1 commit on ga/auth-rl, .gitagent reset, no push
+gitagent finalize --feature auth-rl -m "feat: X"     ← applies again if needed, then 1 commit
+# 1 commit on main, .gitagent reset, no push. Your checkout stays on main.
 ```
 
 `finalize` calls `integrate` internally, so `accept` + `finalize` is the absolute minimum. Run `integrate` standalone when you want to surface conflicts *before* the final commit.
@@ -202,54 +201,44 @@ gitagent finalize -m "feat: X"     ← applies again if needed, then 1 commit
 
 ## 7. The multi-feature loop (parallel features)
 
-The same flow, repeated per feature branch. Switch branches to switch sessions.
+The same flow, repeated per feature name — no branches, no checkouts. Each feature lands its own one commit on `main`.
 
 ```
 SUPERVISOR (single agent, many features in flight)
 ──────────────────────────────────────────────────
 
 # == Feature A: auth rate limiting ==
-git checkout -b ga/auth-rl main
-gitagent start
-gitagent spawn --id a_backend
+gitagent start --feature auth-rl
+gitagent spawn --feature auth-rl --id a_backend
 # ... a_backend proposes ...
-gitagent accept p_x
-gitagent finalize -m "feat(auth): rate limiting"
-# → 1 commit on ga/auth-rl
+gitagent accept p_x --feature auth-rl
+gitagent finalize --feature auth-rl -m "feat(auth): rate limiting"
+# → 1 commit on main
 
 # == Feature B: user profile (started in parallel, finished in parallel) ==
-git checkout -b ga/user-profile main
-gitagent start
-gitagent spawn --id a_frontend
+gitagent start --feature user-profile
+gitagent spawn --feature user-profile --id a_frontend
 # ... a_frontend proposes ...
-gitagent accept p_y
-gitagent finalize -m "feat(user): profile page"
-# → 1 commit on ga/user-profile
+gitagent accept p_y --feature user-profile
+gitagent finalize --feature user-profile -m "feat(user): profile page"
+# → 1 commit on main
 
-# == Land on main (plain git) ==
-git checkout main
-git merge --squash ga/auth-rl      && git commit -m "feat(auth): rate limiting"
-git merge --squash ga/user-profile && git commit -m "feat(user): profile page"
-# OR: open two PRs and let humans review.
+# Both commits are already on main. No git merge needed.
 ```
-
-**Critical:** `gitagent start` **refuses** to run on `main` or `master`. You must
-be on a `ga/<name>` branch. If you see `error: Current branch 'main' is not a
-feature branch`, run `git checkout -b ga/<name> main` first.
 
 ---
 
 ## 8. Critical rules
 
-1. **Never push.** `finalize` produces a local commit on the current feature branch and stops. You push and merge if you want to.
+1. **Never push.** `finalize` produces a local commit on `main` (or `--target`) and stops. You push if you want to.
 2. **Never commit inside an agent worktree directly.** Agents work uncommitted; `propose` snapshots the diff. (You *can* commit locally in a worktree for the agent's own scratch use — just `git add -A` again before `propose` will include those changes too.)
 3. **Always pass `--json` to commands an LLM will consume.** Human output is for humans.
 4. **`diff <pid>` is pipe-friendly** — it's a raw `git diff` patch. Use it to feed another LLM, to `git apply` manually, or to inspect.
 5. **Conflicts don't kill the session.** A `conflict` proposal means "this patch didn't apply cleanly to current integration". Use `revise` to send it back, or fix the integration worktree manually and re-`accept` then re-`integrate`.
 6. **Integration order = proposal creation order.** The first agent to `propose` integrates first. Plan who proposes first if their change is the "base" others depend on.
-7. **`abort` is destructive** — it removes all agent worktrees, branches, and the feature's `.gitagent/` state (keeping the audit log). Use it when you want to start over on a feature.
-8. **`--feature` is the session selector.** All commands that operate on a feature accept `--feature <name>`. Without it, the current branch is used as default (with a deprecation warning). Pass `--feature` explicitly to avoid the checkout dance.
-9. **`finalize` lands on `main` directly** (configurable via `--target`). Uses a detached temp worktree. The user's checkout is never disturbed. The `ga/<feature>` branch is deleted (use `--keep-feature-branch` to preserve it).
+7. **`abort` is destructive** — it removes all agent worktrees and the feature's `.gitagent/` state (keeping the audit log). Use it when you want to start over on a feature.
+8. **`--feature` is the session selector and is required** on every command. There is no branch inference; pass `--feature <name>` explicitly.
+9. **`finalize` lands on `main` directly** (configurable via `--target`). Uses a detached temp worktree. The user's checkout is never disturbed. gitagent never created a branch to delete.
 
 ---
 
@@ -433,7 +422,7 @@ If you `git commit` inside the worktree and then `propose`, the committed change
 | Command | Idempotent? | Notes |
 |---|---|---|
 | `init` | No — errors on re-run | |
-| `start` | No — errors if a session is active for the current feature branch | `git checkout` another `ga/...` branch to switch features; `abort` to clear the current one |
+| `start` | No — errors if a session is active for that feature key | `abort` to clear the current one before restarting |
 | `spawn` | No — errors on duplicate id (per feature) | |
 | `propose` | No — generates a new pid each time | Don't re-propose the same work |
 | `accept` | Yes (from `accepted` not-yet-applied) | From `pending`/`conflict` it resets to `accepted` |
@@ -452,14 +441,14 @@ If you `git commit` inside the worktree and then `propose`, the committed change
 2. **Trying to `finalize` with zero accepted proposals** — errors with "No integrated proposals". Accept at least one first.
 3. **Modifying `.gitagent/features/<key>/integration/worktree` directly without committing** — your changes will be lost on the next `integrate` (which does `git add -A` + commit, so this is usually fine, but don't leave uncommitted work expecting it to persist between integrate runs).
 4. **Running `gitagent` from inside an agent's worktree** — it must run from the repo root (or any subdir; it finds the repo via `git rev-parse --show-toplevel`). Running from a worktree is *technically* fine (it'll find the main repo) but confusing.
-5. **Expecting `abort` to delete the feature branch** — `abort` cleans the feature's `.gitagent/` state and removes agent worktrees, but **the feature branch is preserved**. That's your commit; you merge it to `main`.
+5. **Expecting `abort` to delete a branch** — gitagent never creates branches, so there's nothing to delete. `abort` cleans the feature's `.gitagent/` state and removes agent worktrees.
 6. **Spawning 10 agents and proposing in random order** — integration follows creation order, so the last agent to `propose` will integrate on top. Make the "base" agents propose first.
 7. **Re-proposing after `revise` and trying to "edit" the old `pid`** — `propose` always creates a new `pid`. The old one stays as `revise` (audit trail). Don't try to mutate an existing proposal; submit a new one.
 8. **Treating `accept` as "apply"** — it isn't. Always follow accepts with `integrate` (or `finalize`, which integrates for you) to actually apply.
 9. **Forgetting that `finalize` runs `integrate` first** — if some proposals would conflict, `finalize` will mark them `conflict` and *still* produce a commit with whatever did integrate. To avoid surprise conflicts, run `integrate` standalone and inspect before finalizing.
-10. **Trying `gitagent start` on `main`** — errors with "Current branch 'main' is not a feature branch". Create the feature branch with `git checkout -b ga/<name> main` first.
-11. **Passing `--feature` to `start`** — there's no such flag anymore. The feature name is derived from the branch. If you want a different feature name, use a different branch name.
-12. **Forgetting which branch you're on** — `start`, `spawn`, `propose`, `accept`, `integrate`, `finalize` all operate on the session attached to the *current* branch. Always run `git branch --show-current` first if you're unsure. Use `gitagent list-features` for a global view.
+10. **Forgetting `--feature`** — every command requires `--feature <name>`. There is no branch inference; running without it errors with "A feature name is required".
+11. **Expecting a `ga/<name>` branch** — gitagent never creates one. Features are logical keys; your repo stays on `main` the whole time.
+12. **Forgetting which feature you're on** — always pass `--feature <name>` explicitly to every command. Use `gitagent list-features` for a global view.
 
 ---
 
@@ -471,36 +460,32 @@ If you `git commit` inside the worktree and then `propose`, the committed change
 #!/bin/bash
 set -euo pipefail
 REPO="${1:?repo path}"
-FEATURE_BRANCH="${2:?feature branch, e.g. ga/auth-rl}"
+FEATURE="${2:?feature name, e.g. auth-rl}"
 MSG="${3:?commit message}"
 cd "$REPO"
 
 gitagent init
-# The user (or orchestration) has already created the feature branch.
-# If not:
-#   git checkout -b "$FEATURE_BRANCH" main
-git checkout "$FEATURE_BRANCH"
-gitagent start
+gitagent start --feature "$FEATURE"
 
 # spawn agents (your orchestration decides the work split)
-gitagent spawn --id a_backend --role "implement core"
-gitagent spawn --id a_tests   --role "write tests"
+gitagent spawn --feature "$FEATURE" --id a_backend --role "implement core"
+gitagent spawn --feature "$FEATURE" --id a_tests   --role "write tests"
 
 # ... agents do their work and propose ...
 # (in practice, you poll or wait for proposals)
 
 # accept everything pending
-for pid in $(gitagent proposals --json | python -c '
+for pid in $(gitagent proposals --feature "$FEATURE" --json | python -c '
 import sys, json
 for p in json.load(sys.stdin):
     if p["review"]["state"] == "pending":
         print(p["manifest"]["id"])
 '); do
-  gitagent accept "$pid"
+  gitagent accept "$pid" --feature "$FEATURE"
 done
 
 # OPTIONAL: pre-flight integrate to surface conflicts before committing
-summary=$(gitagent integrate --json)
+summary=$(gitagent integrate --feature "$FEATURE" --json)
 conflicts=$(echo "$summary" | python -c 'import sys,json;print(",".join(json.load(sys.stdin)["conflicted"]))')
 if [ -n "$conflicts" ]; then
   echo "Conflicts: $conflicts" >&2
@@ -508,11 +493,11 @@ if [ -n "$conflicts" ]; then
   exit 1
 fi
 
-gitagent finalize --message "$MSG"
-# Then the supervisor (or user) merges the feature branch into main with git.
+gitagent finalize --feature "$FEATURE" --message "$MSG"
+# Your repo stays on main; one commit landed on main. Push if you want to.
 ```
 
-### Recipe: drive two features in parallel, then merge to main
+### Recipe: drive two features in parallel (each lands on main)
 
 ```bash
 #!/bin/bash
@@ -523,28 +508,22 @@ cd "$REPO"
 gitagent init
 
 # Feature A
-git checkout -b ga/auth-rl main
-gitagent start
-gitagent spawn --id a_backend
+gitagent start --feature auth-rl
+gitagent spawn --feature auth-rl --id a_backend
 # ... wait for a_backend to propose ...
-gitagent accept "$(gitagent proposals --json | python -c 'import sys,json;print(json.load(sys.stdin)[0]["manifest"]["id"])')"
-gitagent integrate
-gitagent finalize -m "feat(auth): rate limiting"
+gitagent accept "$(gitagent proposals --feature auth-rl --json | python -c 'import sys,json;print(json.load(sys.stdin)[0]["manifest"]["id"])')" --feature auth-rl
+gitagent integrate --feature auth-rl
+gitagent finalize --feature auth-rl -m "feat(auth): rate limiting"
 
 # Feature B (parallel)
-git checkout main
-git checkout -b ga/user-profile main
-gitagent start
-gitagent spawn --id a_frontend
+gitagent start --feature user-profile
+gitagent spawn --feature user-profile --id a_frontend
 # ... wait for a_frontend to propose ...
-gitagent accept "$(gitagent proposals --json | python -c 'import sys,json;print(json.load(sys.stdin)[0]["manifest"]["id"])')"
-gitagent integrate
-gitagent finalize -m "feat(user): profile page"
+gitagent accept "$(gitagent proposals --feature user-profile --json | python -c 'import sys,json;print(json.load(sys.stdin)[0]["manifest"]["id"])')" --feature user-profile
+gitagent integrate --feature user-profile
+gitagent finalize --feature user-profile -m "feat(user): profile page"
 
-# Land both on main
-git checkout main
-git merge --squash ga/auth-rl      && git commit -m "feat(auth): rate limiting"
-git merge --squash ga/user-profile && git commit -m "feat(user): profile page"
+# Both commits are already on main. Push when ready.
 ```
 
 ### Recipe: subagent proposal
@@ -602,43 +581,38 @@ def git(*args, cwd=None):
         raise RuntimeError(f"git {' '.join(args)}: {r.stderr}")
     return r.stdout.strip()
 
-# Set up a feature (the orchestration creates the branch)
-git("checkout", "-b", "ga/rate-limiter", "main")
+# Set up a feature (no branch needed — just a logical name)
 ga("init")
-ga("start")  # feature name = "rate-limiter" (derived from the branch)
-ga("spawn", "--id", "a_backend")
+ga("start", "--feature", "rate-limiter")
+ga("spawn", "--feature", "rate-limiter", "--id", "a_backend")
 # ... (subagent works) ...
-ga("propose", "--agent", "a_backend", "--title", "limiter", "--confidence", "0.9")
+ga("propose", "--feature", "rate-limiter", "--agent", "a_backend", "--title", "limiter", "--confidence", "0.9")
 
-proposals = json.loads(ga("proposals", "--json"))
+proposals = json.loads(ga("proposals", "--feature", "rate-limiter", "--json"))
 for p in proposals:
     if p["review"]["state"] == "pending":
-        diff = ga("diff", p["manifest"]["id"])
+        diff = ga("diff", p["manifest"]["id"], "--feature", "rate-limiter")
         decision = ask_llm(diff)  # "accept" / "reject" / "revise"
         if decision == "accept":
-            ga("accept", p["manifest"]["id"])
+            ga("accept", p["manifest"]["id"], "--feature", "rate-limiter")
         elif decision == "reject":
-            ga("reject", p["manifest"]["id"], "--reason", "...")
+            ga("reject", p["manifest"]["id"], "--feature", "rate-limiter", "--reason", "...")
         else:
-            ga("revise", p["manifest"]["id"], "--feedback", "...")
+            ga("revise", p["manifest"]["id"], "--feature", "rate-limiter", "--feedback", "...")
 
-summary = json.loads(ga("integrate", "--json"))
+summary = json.loads(ga("integrate", "--feature", "rate-limiter", "--json"))
 if summary["conflicted"]:
     for pid in summary["conflicted"]:
         print(f"conflict: {pid} → revise or fix manually")
 else:
-    ga("finalize", "--message", "feat: rate limiter")
+    ga("finalize", "--feature", "rate-limiter", "--message", "feat: rate limiter")
 
-# Now start another feature in parallel
-git("checkout", "main")
-git("checkout", "-b", "ga/other-feature", "main")
-ga("start")
+# Now start another feature in parallel — your repo stays on main throughout
+ga("start", "--feature", "other-feature")
 # ... etc ...
 
-# When all features are done, the supervisor lands on main
-git("checkout", "main")
-git("merge", "--squash", "ga/rate-limiter")
-git("commit", "-m", "feat: rate limiter")
+# When all features are finalized, each produced one commit on main.
+# Push when ready.
 ```
 
 ---
@@ -648,16 +622,16 @@ git("commit", "-m", "feat: rate limiter")
 ```
 <repo>/.gitagent/
 ├── features/
-│   ├── <feature-key>/         # one per feature branch (e.g. 'auth-rl' for ga/auth-rl)
-│   │   ├── session.json       # active session: id, feature, base_sha, state, branch
+│   ├── <feature-key>/         # one per feature (e.g. 'auth-rl')
+│   │   ├── session.json       # active session: id, feature, base_sha, state, target_branch
 │   │   ├── agents/<id>/
-│   │   │   ├── meta.json      # role, worktree, branch, base_sha
+│   │   │   ├── meta.json      # role, worktree, base_sha, base_ref
 │   │   │   └── worktree/      # the agent's isolated git worktree
 │   │   ├── proposals/<pid>/
 │   │   │   ├── manifest.json  # id, agent_id, base_sha, title, files, summary, confidence
 │   │   │   ├── change.patch   # raw git diff of the proposal
 │   │   │   └── review.json    # state, feedback, integrated, integration_sha
-│   │   ├── integration/worktree/  # the integration branch's worktree
+│   │   ├── integration/worktree/  # the detached integration worktree (no branch)
 │   │   └── locks/             # fcntl lockfiles (one per resource)
 │   └── ...
 └── log.jsonl                  # append-only audit trail (global; spans all features)
@@ -677,4 +651,4 @@ This is the multi-feature release. Known limitations, in priority order:
 - **No GitHub PR export** — you finalize to a local commit on the feature branch, then `git push` and open a PR yourself. The supervisor merges to `main` (squash, PR, etc.). Roadmap v0.4.
 - **No Neo4j "virtual commits" sync** — the audit log is on disk but not graph-linked. Roadmap v0.4.
 - **No reordering of integration** — integration follows proposal creation order within a feature. There's no `gitagent reorder` command. Workaround: plan propose order, or fix conflicts as they come.
-- **No automatic cross-feature ordering** — if feature A and feature B touch the same file, the supervisor's merge of A into `main` may conflict with B. Detect by inspecting `gitagent list-features` and planning merge order. Workaround: merge features to `main` in the dependency order; or rebase `ga/<later>` on `main` after `main` moves.
+- **No automatic cross-feature ordering** — if feature A and feature B touch the same file, the later `finalize` may conflict with the earlier on `main`. Detect by inspecting `gitagent list-features` and planning finalize order; or rebase/fix the conflicting proposal before finalizing.

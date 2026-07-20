@@ -8,31 +8,28 @@ FEATURE_PREFIX = "ga/"
 
 
 def slugify(branch: str) -> str:
-    """Turn a feature branch name (e.g. 'ga/auth-rl') into a safe directory key.
+    """Turn a feature key into a safe directory key.
 
-    - 'ga/' prefix is stripped.
-    - '/' are converted to '__' so the result is a single segment.
+    - any '/' are converted to '__' so the result is a single segment.
     - any other non-alphanumeric character is replaced with '-'.
+
+    Accepts either a bare key ('auth-rl') or a legacy 'ga/auth-rl' form.
     """
-    if not branch.startswith(FEATURE_PREFIX):
-        raise GitAgentError(
-            f"Branch '{branch}' is not a feature branch. "
-            f"Feature branches must start with '{FEATURE_PREFIX}'. "
-            f"Create one with `git checkout -b {FEATURE_PREFIX}<name>` first."
-        )
-    rest = branch[len(FEATURE_PREFIX):]
-    rest = rest.replace("/", "__")
-    rest = re.sub(r"[^A-Za-z0-9._-]", "-", rest)
-    if not rest or rest in (".", ".."):
-        raise GitAgentError(f"Branch '{branch}' yields an invalid feature key.")
-    return rest
+    name = branch
+    if name.startswith(FEATURE_PREFIX):
+        name = name[len(FEATURE_PREFIX):]
+    name = name.replace("/", "__")
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", name)
+    if not name or name in (".", ".."):
+        raise GitAgentError(f"Feature name '{branch}' yields an invalid feature key.")
+    return name
 
 
 def coerce(name: str) -> str:
     """Normalize a user-provided feature name into a safe key.
 
     Accepts 'ga/foo', 'foo', 'ga/foo/bar', 'foo__bar'.
-    Always returns the bare name (no prefix): 'foo', 'foo/bar' (with '/' → '__').
+    Always returns the bare key (no prefix): 'foo', 'foo__bar'.
     """
     if name.startswith(FEATURE_PREFIX):
         name = name[len(FEATURE_PREFIX):]
@@ -48,15 +45,21 @@ def is_feature_branch(branch: str | None) -> bool:
 
 
 def name_from_branch(branch: str) -> str:
-    """Human-readable feature name derived from a feature branch.
+    """Human-readable feature name derived from a feature branch or key.
 
     'ga/auth-rate-limiting' -> 'auth-rate-limiting'
+    'auth-rate-limiting'    -> 'auth-rate-limiting'
     """
-    return branch[len(FEATURE_PREFIX):]
+    if branch.startswith(FEATURE_PREFIX):
+        return branch[len(FEATURE_PREFIX):]
+    return branch
 
 
 def branch_for_feature(name: str) -> str:
     """Canonical feature branch name for a user-provided feature name.
+
+    Kept only for backward compatibility / display. gitagent no longer
+    creates feature branches in the user's repository.
 
     'auth-rl'       -> 'ga/auth-rl'
     'ga/auth-rl'    -> 'ga/auth-rl'

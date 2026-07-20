@@ -20,11 +20,18 @@ def _edit(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _branches(repo: Path) -> list[str]:
+    return [
+        b.strip()
+        for b in _git(["branch", "--format=%(refname:short)"], repo).splitlines()
+    ]
+
+
 @pytest.fixture
 def repo_with_two_finalized_features(tmp_path: Path) -> Path:
     """A repo where two features were started from main and finalized onto main.
 
-    In the new model, finalize lands directly on main — no ga/ branches survive.
+    Branchless model: finalize lands directly on main — no ga/ branches ever exist.
     """
     r = tmp_path / "repo"
     r.mkdir()
@@ -73,11 +80,11 @@ def test_finalize_lands_on_main_directly(repo_with_two_finalized_features: Path)
     assert (r / "b.txt").read_text() == "from feature b\n"
 
 
-def test_feature_branches_deleted_after_finalize(repo_with_two_finalized_features: Path) -> None:
-    """ga/<feature> branches are deleted after finalize (unless --keep-feature-branch)."""
+def test_no_feature_branches_ever_created(repo_with_two_finalized_features: Path) -> None:
+    """gitagent never creates ga/<feature> branches in the user's repo."""
     r = repo_with_two_finalized_features
-    assert not gitwrap.branch_exists("ga/feature-a", cwd=r)
-    assert not gitwrap.branch_exists("ga/feature-b", cwd=r)
+    branches = _branches(r)
+    assert branches == ["main"]
 
 
 def test_feature_dirs_cleaned_after_finalize(repo_with_two_finalized_features: Path) -> None:
@@ -99,12 +106,12 @@ def test_audit_log_preserved_after_finalize(repo_with_two_finalized_features: Pa
 def test_start_on_main_without_feature_flag_fails(repo_with_two_finalized_features: Path) -> None:
     r = repo_with_two_finalized_features
     _git(["checkout", "-q", "main"], r)
-    with pytest.raises(GitAgentError, match="Could not determine"):
+    with pytest.raises(GitAgentError, match="feature name is required"):
         session.start(r)
 
 
 def test_start_on_main_with_feature_flag_works(tmp_path: Path) -> None:
-    """New model: start from main using --feature, no checkout needed."""
+    """Branchless model: start from main using --feature, no checkout needed."""
     r = tmp_path / "repo"
     r.mkdir()
     _git(["init", "-q", "-b", "main"], r)
@@ -119,15 +126,10 @@ def test_start_on_main_with_feature_flag_works(tmp_path: Path) -> None:
     _git(["checkout", "-q", "main"], r)
     s = session.start(r, feature_name="my-feature")
     assert s.feature == "my-feature"
-    assert s.branch == "ga/my-feature"
     assert s.target_branch == "main"
-    # Feature branch was created
-    assert gitwrap.branch_exists("ga/my-feature", cwd=r)
-    # But the working tree is still on main (start checked out ga/my-feature
-    # internally for the session, but that's the internal branch)
-    # Actually in our new model, start does checkout ga/<feature>
-    # so we are now on ga/my-feature
-    assert gitwrap.current_branch(r) == "ga/my-feature"
+    # No feature branch is created; user stays on main.
+    assert _branches(r) == ["main"]
+    assert gitwrap.current_branch(r) == "main"
     # Clean up
     session.abort(r, feature_name="my-feature")
 
@@ -159,8 +161,8 @@ def test_crosstalk_isolation(tmp_path: Path) -> None:
     assert store.proposal_ids(p2) == []
 
 
-def test_finalize_with_keep_feature_branch(tmp_path: Path) -> None:
-    """--keep-feature-branch preserves the ga/<feature> branch after finalize."""
+def test_finalize_keeps_user_on_main(tmp_path: Path) -> None:
+    """Even after finalize, the user's checkout never moves off main."""
     r = tmp_path / "repo"
     r.mkdir()
     _git(["init", "-q", "-b", "main"], r)
@@ -179,12 +181,10 @@ def test_finalize_with_keep_feature_branch(tmp_path: Path) -> None:
     _edit(wt / "data.txt", "data\n")
     proposals.propose(r, agent_id="agent1", title="add data", feature="my-feat")
     review.accept(r, proposal_id=store.proposal_ids(p)[0], feature="my-feat")
-    finalize.finalize(
-        r, message="feat: data", feature="my-feat", keep_feature_branch=True,
-    )
+    finalize.finalize(r, message="feat: data", feature="my-feat")
 
-    # Branch preserved
-    assert gitwrap.branch_exists("ga/my-feat", cwd=r)
-    # But .gitagent/features/<key>/ is still cleaned up
+    # User still on main; no feature branch leaked.
+    assert gitwrap.current_branch(r) == "main"
+    assert _branches(r) == ["main"]
     items = session.features_summary(r)
     assert items == []

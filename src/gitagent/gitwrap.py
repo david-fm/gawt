@@ -66,15 +66,6 @@ def is_clean(cwd: Path | str | None = None) -> bool:
     return run(["status", "--porcelain"], cwd=cwd).strip() == ""
 
 
-def worktree_add(
-    path: Path | str,
-    branch: str,
-    base_ref: str,
-    cwd: Path | str | None = None,
-) -> None:
-    run(["worktree", "add", "-b", branch, str(path), base_ref], cwd=cwd)
-
-
 def worktree_add_detached(
     path: Path | str,
     ref: str,
@@ -98,16 +89,6 @@ def worktree_remove(
 def worktree_prune(cwd: Path | str | None = None) -> None:
     with contextlib.suppress(GitAgentError):
         run(["worktree", "prune", "--expire=now"], cwd=cwd)
-
-
-def branch_exists(branch: str, cwd: Path | str | None = None) -> bool:
-    return run_ok(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=cwd)
-
-
-def branch_delete(branch: str, *, force: bool = True, cwd: Path | str | None = None) -> None:
-    args = ["branch", "-D" if force else "-d", branch]
-    with contextlib.suppress(GitAgentError):
-        run(args, cwd=cwd)
 
 
 def commit(message: str, *, sign: bool = False, cwd: Path | str | None = None) -> str:

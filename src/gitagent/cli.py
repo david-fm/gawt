@@ -13,7 +13,6 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from . import agents as agents_mod
-from . import feature as feature_mod
 from . import finalize as finalize_mod
 from . import gitwrap, store
 from . import proposals as proposals_mod
@@ -37,8 +36,6 @@ err_console = Console(stderr=True)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-_LEGACY_WARNED: set[str] = set()
-
 
 def _catch(fn: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(fn)
@@ -57,33 +54,19 @@ def _print_json(obj: Any) -> None:
 
 
 def _resolve_paths(feature: str | None = None) -> store.Paths:
-    """Resolve paths for a feature, using --feature or the current branch."""
+    """Resolve paths for a feature.  --feature is required (branchless model)."""
     repo = gitwrap.resolve(None)
-    if feature is not None:
-        return store.paths_for_feature(repo, feature)
-    return store.current_feature_paths(repo)
-
-
-def _warn_legacy(command: str, feature: str | None) -> None:
-    """Emit a deprecation warning when feature is inferred from the current branch."""
-    if feature is not None:
-        return
-    key = f"warn-{command}"
-    if key in _LEGACY_WARNED:
-        return
-    _LEGACY_WARNED.add(key)
-    branch = gitwrap.current_branch(gitwrap.resolve(None))
-    if branch and feature_mod.is_feature_branch(branch):
-        err_console.print(
-            f"[yellow]warning:[/yellow] deriving feature from current branch "
-            f"'{branch}' is deprecated.  Pass [cyan]--feature[/cyan] explicitly."
+    if feature is None:
+        raise GitAgentError(
+            "A feature name is required.  Pass --feature <name> explicitly."
         )
+    return store.paths_for_feature(repo, feature)
 
 
 # --- Feature option reused across commands ----------------------------------
 
 _FEATURE_OPT = typer.Option(
-    None, "--feature", help="Feature name (default: infer from current branch ga/...).",
+    None, "--feature", help="Feature name (required; gitagent does not use git branches).",
 )
 
 
@@ -107,16 +90,17 @@ def start(
     feature: str = _FEATURE_OPT,
     target: str = typer.Option("main", "--target", help="Branch where finalize lands commits."),
 ) -> None:
-    """Open a session for a feature.  Creates the ga/<feature> branch if needed.
+    """Open a session for a feature.
 
-    Without --feature the current branch is used (if it is ga/...), with a
-    deprecation warning.  Pass --feature explicitly to avoid the checkout dance.
+    gitagent is fully decoupled from your branches: no feature branch is
+    created and your current checkout (e.g. main) is never changed.  Pass
+    --feature explicitly; the feature is a logical key, not a git branch.
     """
-    _warn_legacy("start", feature)
     s = session_mod.start(feature_name=feature, target_branch=target)
     console.print(
         f"[green]Session[/green] [bold]{s.id}[/bold] [dim]({s.feature})[/dim] "
-        f"at {s.base_sha[:7]} on [cyan]{s.branch}[/cyan] -> [cyan]{s.target_branch}[/cyan]."
+        f"at {s.base_sha[:7]} -> [cyan]{s.target_branch}[/cyan] "
+        f"[dim](your checkout is untouched)[/dim]."
     )
 
 
@@ -138,7 +122,6 @@ def status(
         # detail view for one feature
         p = store.paths_for_feature(repo, feature)
         session = store.load_session(p)
-        _warn_legacy("status", feature)
         if session is None:
             console.print(
                 f"[yellow]No active session for feature '{feature}'.[/yellow] "
@@ -150,7 +133,6 @@ def status(
         return
 
     # multi-feature summary (default)
-    _warn_legacy("status", feature)
     items = session_mod.features_summary(repo)
     if not items:
         console.print("[dim]No features yet. Start one with "
@@ -188,7 +170,7 @@ def _print_feature_detail(p: store.Paths, session: Any) -> None:
         Panel.fit(
             f"Session [bold]{session.id}[/bold]  [dim]{session.feature}[/dim]\n"
             f"state: [cyan]{session.state.value}[/cyan]   base: {session.base_sha[:7]} "
-            f"on [cyan]{session.branch}[/cyan]  target: [cyan]{session.target_branch}[/cyan]\n"
+            f"target: [cyan]{session.target_branch}[/cyan]\n"
             f"integration: {integrated} applied",
             title="gitagent status",
         )
@@ -198,9 +180,9 @@ def _print_feature_detail(p: store.Paths, session: Any) -> None:
     at.add_column("id", style="cyan")
     at.add_column("state")
     at.add_column("base", style="dim")
-    at.add_column("branch")
+    at.add_column("worktree", style="dim")
     for a in agents:
-        at.add_row(a["id"], a["state"], a["base_sha"][:7], a["branch"])
+        at.add_row(a["id"], a["state"], a["base_sha"][:7], a["worktree"])
     if agents:
         console.print(at)
 
@@ -228,7 +210,7 @@ def _print_features_table(features: list[dict[str, Any]]) -> None:
     if not features:
         return
     ft = Table(title="Features in this repo", show_lines=False)
-    ft.add_column("branch", style="cyan")
+    ft.add_column("feature", style="cyan")
     ft.add_column("session", style="dim")
     ft.add_column("state")
     ft.add_column("target", style="dim")
@@ -236,7 +218,7 @@ def _print_features_table(features: list[dict[str, Any]]) -> None:
     ft.add_column("proposals", justify="right")
     for f in features:
         ft.add_row(
-            f.get("branch", "?"),
+            f.get("feature") or f.get("key", "?"),
             f.get("session") or "-",
             f.get("state", "-"),
             f.get("target", "main"),
@@ -296,7 +278,6 @@ def abort(
     feature: str = _FEATURE_OPT,
 ) -> None:
     """Discard a feature's session: remove worktrees, reset .gitagent state."""
-    _warn_legacy("abort", feature)
     session_mod.abort(feature_name=feature)
     console.print(
         "[yellow]Session aborted.[/yellow] Worktrees removed, .gitagent reset."
@@ -315,11 +296,9 @@ def spawn(
     role: str = typer.Option("", "--role", help="Role / task description."),
 ) -> None:
     """Create an isolated worktree for a subagent."""
-    _warn_legacy("spawn", feature)
     a = agents_mod.spawn(agent_id=id, base=base, role=role, feature=feature)
     console.print(
-        f"[green]Agent[/green] [bold]{a.id}[/bold] -> [dim]{a.worktree}[/dim] "
-        f"[cyan]{a.branch}[/cyan]"
+        f"[green]Agent[/green] [bold]{a.id}[/bold] -> [dim]{a.worktree}[/dim]"
     )
 
 
@@ -330,7 +309,6 @@ def list_agents(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """List agents in a feature's session."""
-    _warn_legacy("list-agents", feature)
     items = agents_mod.list_agents(feature=feature)
     if json_out:
         _print_json(items)
@@ -340,9 +318,9 @@ def list_agents(
     t.add_column("state")
     t.add_column("role", style="dim")
     t.add_column("base", style="dim")
-    t.add_column("branch")
+    t.add_column("worktree", style="dim")
     for a in items:
-        t.add_row(a["id"], a["state"], a["role"], a["base_sha"][:7], a["branch"])
+        t.add_row(a["id"], a["state"], a["role"], a["base_sha"][:7], a["worktree"])
     if items:
         console.print(t)
     else:
@@ -356,7 +334,6 @@ def kill(
     feature: str = _FEATURE_OPT,
 ) -> None:
     """Remove an agent's worktree and ephemeral branch."""
-    _warn_legacy("kill", feature)
     agents_mod.kill(agent_id=id, feature=feature)
     console.print(f"[yellow]Removed agent[/yellow] [bold]{id}[/bold].")
 
@@ -374,7 +351,6 @@ def propose(
     confidence: float = typer.Option(None, "--confidence", help="Confidence score 0..1."),
 ) -> None:
     """Capture the agent's current worktree changes as a patch proposal."""
-    _warn_legacy("propose", feature)
     p = proposals_mod.propose(
         agent_id=agent, title=title, summary=summary, confidence=confidence,
         feature=feature,
@@ -392,7 +368,6 @@ def proposals(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """List proposals and their review state."""
-    _warn_legacy("proposals", feature)
     items = proposals_mod.list_proposals(feature=feature)
     if json_out:
         _print_json(items)
@@ -425,7 +400,6 @@ def show(
     feature: str = _FEATURE_OPT,
 ) -> None:
     """Show a proposal's diff with syntax highlighting."""
-    _warn_legacy("show", feature)
     patch = proposals_mod.read_patch(proposal_id=proposal_id, feature=feature)
     console.print(
         Syntax(patch, "diff", theme="ansi_dark", word_wrap=False, background_color="default")
@@ -439,7 +413,6 @@ def diff(
     feature: str = _FEATURE_OPT,
 ) -> None:
     """Print a proposal's raw diff (pipe-friendly, for LLMs)."""
-    _warn_legacy("diff", feature)
     patch = proposals_mod.read_patch(proposal_id=proposal_id, feature=feature)
     sys.stdout.write(patch)
 
@@ -454,7 +427,6 @@ def accept(
     feature: str = _FEATURE_OPT,
 ) -> None:
     """Mark a proposal as accepted (decision only). Run `gitagent integrate` to apply it."""
-    _warn_legacy("accept", feature)
     review_mod.accept(proposal_id=proposal_id, feature=feature)
     console.print(
         f"[green]Accepted[/green] [bold]{proposal_id}[/bold] "
@@ -470,7 +442,6 @@ def reject(
     feature: str = _FEATURE_OPT,
 ) -> None:
     """Reject a proposal (the patch is not applied)."""
-    _warn_legacy("reject", feature)
     review_mod.reject(proposal_id=proposal_id, reason=reason, feature=feature)
     console.print(f"[red]Rejected[/red] [bold]{proposal_id}[/bold].")
 
@@ -483,7 +454,6 @@ def revise(
     feature: str = _FEATURE_OPT,
 ) -> None:
     """Send a proposal back for another iteration."""
-    _warn_legacy("revise", feature)
     review_mod.revise(proposal_id=proposal_id, feedback=feedback, feature=feature)
     console.print(f"[yellow]Sent back for revision[/yellow] [bold]{proposal_id}[/bold].")
 
@@ -500,7 +470,6 @@ def integrate(
     branch before applying proposals, so cross-feature conflicts are
     detected immediately.
     """
-    _warn_legacy("integrate", feature)
     summary = review_mod.integrate(feature=feature)
     if json_out:
         _print_json(summary)
@@ -525,20 +494,15 @@ def finalize(
     message: str = typer.Option(..., "--message", "-m", help="Commit message."),
     target: str = typer.Option(None, "--target", help="Override target branch for this finalize."),
     sign: bool = typer.Option(False, "--sign", help="GPG-sign the commit."),
-    keep_feature_branch: bool = typer.Option(
-        False, "--keep-feature-branch",
-        help="Keep the ga/<feature> branch after finalize (default: delete it).",
-    ),
 ) -> None:
     """Produce ONE commit on the target branch (default: main) and reset .gitagent.
 
-    Uses a detached temp worktree to avoid touching the user's checkout.
-    The ga/<feature> branch is deleted after finalize unless --keep-feature-branch.
+    Uses a detached temp worktree to avoid touching the user's checkout.  Your
+    own checkout is never switched or modified.
     """
-    _warn_legacy("finalize", feature)
     sha = finalize_mod.finalize(
         message=message, feature=feature, target=target,
-        sign=sign, keep_feature_branch=keep_feature_branch,
+        sign=sign,
     )
     console.print(
         f"[green]Finalized.[/green] Single commit [bold]{sha[:7]}[/bold]. "

@@ -39,14 +39,6 @@ def _ensure_gitignored(repo: Path) -> None:
         gi.write_text("\n".join(needed) + "\n", encoding="utf-8")
 
 
-def _infer_feature_from_branch(repo: Path) -> str | None:
-    """Try to derive a feature name from the current branch."""
-    branch = gitwrap.current_branch(repo)
-    if branch and feature.is_feature_branch(branch):
-        return feature.name_from_branch(branch)
-    return None
-
-
 def start(
     repo: Path | None = None,
     *,
@@ -55,53 +47,45 @@ def start(
 ) -> Session:
     """Open a session for a feature.
 
-    If *feature_name* is ``None`` the current branch is used (if it is a
-    ``ga/<name>`` branch).  The ``ga/<feature>`` branch is created from
-    *target_branch* if it does not already exist — no checkout is required.
+    gitagent is fully decoupled from the user's branches: no ``ga/<feature>``
+    branch is created and the user's current checkout is never changed.  The
+    feature is a logical key (a directory under ``.gitagent/features/<key>/``).
+    All work happens in detached worktrees derived from *target_branch*.  The
+    target branch is only touched by ``finalize``, which writes one commit.
     """
     repo = gitwrap.resolve(repo)
     store.require_init(repo)
 
     if feature_name is None:
-        feature_name = _infer_feature_from_branch(repo)
-    if feature_name is None:
         raise GitAgentError(
-            "Could not determine the feature name.  "
-            "Pass --feature <name> or `git checkout -b ga/<name>` first."
+            "A feature name is required.  Pass --feature <name> explicitly."
         )
 
-    feat_branch = feature.branch_for_feature(feature_name)
-    if not gitwrap.branch_exists(feat_branch, cwd=repo):
-        # Create the feature branch from the current HEAD of the target.
-        target_sha = gitwrap.run(["rev-parse", target_branch], cwd=repo).strip()
-        gitwrap.run(["branch", feat_branch, target_sha], cwd=repo)
-
-    # Switch to the feature branch so that worktree operations and refs work.
-    gitwrap.run(["checkout", feat_branch], cwd=repo)
-
-    feature_key = feature.slugify(feat_branch)
+    feature_key = feature.slugify(feature_name)
     p = store.paths(repo, feature_key)
     store.ensure_dirs(p)
     if store.load_session(p) is not None:
         raise GitAgentError(
-            f"A session is already active for this feature ({feat_branch}). "
+            f"A session is already active for this feature ({feature_key}). "
             f"Run `gitagent abort` to discard, or `gitagent status` to inspect."
         )
 
-    base_sha = gitwrap.current_sha(repo)
+    # Base the session on the live target branch HEAD.  We never create a
+    # branch for the feature; the base SHA anchors every detached worktree.
+    base_sha = gitwrap.run(["rev-parse", target_branch], cwd=repo).strip()
+
     sid = "s_" + secrets.token_hex(4)
     integration_branch = f"gitagent/integration/{feature_key}/{sid}"
     integration_worktree = p.integration / "worktree"
 
-    gitwrap.worktree_add(integration_worktree, integration_branch, base_sha, cwd=repo)
+    # Detached worktree on the target branch — no branch is created for it.
+    gitwrap.worktree_add_detached(integration_worktree, target_branch, cwd=repo)
 
     session = Session(
         id=sid,
-        feature=feature_name,
+        feature=feature.name_from_branch(feature_name),
         feature_key=feature_key,
-        branch=feat_branch,
         base_sha=base_sha,
-        base_branch=feat_branch,
         integration_branch=integration_branch,
         integration_worktree=str(integration_worktree),
         target_branch=target_branch,
@@ -117,7 +101,6 @@ def start(
             "feature_key": feature_key,
             "feature": session.feature,
             "session": sid,
-            "branch": feat_branch,
             "base_sha": base_sha,
             "target_branch": target_branch,
         },
@@ -148,18 +131,13 @@ def status_snapshot(
         session = store.load_session(p)
         return _snapshot_for_paths(p, session)
 
-    # No feature specified: try current branch, then all features.
-    try:
-        p = store.current_feature_paths(repo)
-    except GitAgentError:
-        return {
-            "initialized": True,
-            "session": None,
-            "branch": gitwrap.current_branch(repo),
-            "features": _features_summary(repo),
-        }
-    session = store.load_session(p)
-    return _snapshot_for_paths(p, session)
+    # No feature specified: show a summary of all features.
+    return {
+        "initialized": True,
+        "session": None,
+        "branch": gitwrap.current_branch(repo),
+        "features": _features_summary(repo),
+    }
 
 
 def _snapshot_for_paths(p: store.Paths, session: Session | None) -> dict[str, Any]:
@@ -223,13 +201,12 @@ def features_summary(repo: Path) -> list[dict[str, Any]]:
             continue
         out.append(
             {
-                "key": key,
-                "session": s.id,
-                "feature": s.feature,
-                "state": s.state.value,
-                "branch": s.branch,
-                "target": s.target_branch,
-                "integration_branch": s.integration_branch,
+        "key": key,
+            "session": s.id,
+            "feature": s.feature,
+            "state": s.state.value,
+            "target": s.target_branch,
+            "integration_branch": s.integration_branch,
                 "proposals": len(store.proposal_ids(p)),
                 "agents": len(store.agent_ids(p)),
             }

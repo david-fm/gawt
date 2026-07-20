@@ -31,9 +31,7 @@ class Session:
     id: str
     feature: str
     feature_key: str
-    branch: str
     base_sha: str
-    base_branch: str
     integration_branch: str
     integration_worktree: str
     target_branch: str = "main"
@@ -46,9 +44,7 @@ class Session:
             "id": self.id,
             "feature": self.feature,
             "feature_key": self.feature_key,
-            "branch": self.branch,
             "base_sha": self.base_sha,
-            "base_branch": self.base_branch,
             "integration_branch": self.integration_branch,
             "integration_worktree": self.integration_worktree,
             "target_branch": self.target_branch,
@@ -63,9 +59,7 @@ class Session:
             id=d["id"],
             feature=d["feature"],
             feature_key=d.get("feature_key", d.get("feature", "")),
-            branch=d.get("branch", d.get("base_branch", "")),
             base_sha=d["base_sha"],
-            base_branch=d["base_branch"],
             integration_branch=d["integration_branch"],
             integration_worktree=d["integration_worktree"],
             target_branch=d.get("target_branch", "main"),
@@ -81,7 +75,6 @@ class Agent:
     role: str
     base_sha: str
     base_ref: str
-    branch: str
     worktree: str
     state: AgentState = AgentState.ACTIVE
     created_at: str = ""
@@ -92,7 +85,6 @@ class Agent:
             "role": self.role,
             "base_sha": self.base_sha,
             "base_ref": self.base_ref,
-            "branch": self.branch,
             "worktree": self.worktree,
             "state": self.state.value,
             "created_at": self.created_at,
@@ -105,7 +97,6 @@ class Agent:
             role=d.get("role", ""),
             base_sha=d["base_sha"],
             base_ref=d.get("base_ref", d["base_sha"]),
-            branch=d["branch"],
             worktree=d["worktree"],
             state=AgentState(d.get("state", "active")),
             created_at=d.get("created_at", ""),

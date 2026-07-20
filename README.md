@@ -4,14 +4,14 @@
 
 `gitagent` is a lightweight CLI that wraps `git worktree` so a **superagent** can spawn isolated **subagents** per feature, collect their work as **proposals** (patch + manifest), accept/reject/revise them, and finally produce **one clean commit on `main`** — then clean everything up. It never pushes.
 
-**Branchless workflow**: you never need to `git checkout ga/<feature>`. All commands accept `--feature <name>`. Your local repo stays on `main` (or wherever you are) throughout.
+**Decoupled from your git branches**: gitagent never creates or switches branches in your repository. All work happens in **detached worktrees** derived from `main`. Every command requires `--feature <name>` (a logical key, not a git branch). Your local repo stays on `main` throughout — agents, integration and proposals are fully isolated coordination state, never refs in your repo.
 
-The headline feature: **multiple features in parallel**. Create one git branch per feature (`ga/<name>`), run `gitagent start` on each, and switch between them. Each feature keeps its own session, agents, proposals, and integration branch. The superagent merges each finished feature branch into `main` with normal git.
+The headline feature: **multiple features in parallel, with multiple agents per feature**. Run `gitagent start --feature <name>` for each, spawn agents per feature, and switch between them. Each feature keeps its own session, agents, proposals, and an integration worktree. `finalize` writes exactly one commit on `main` per feature.
 
 Two planes are kept strictly separate:
 
-- **`.git`** — the source of truth. Untouched until `finalize`, which writes exactly one commit on `main` (or a configured target).
-- **`.gitagent/`** — an ephemeral coordination layer, one subdirectory per feature: worktrees, patches, manifests, decisions, audit log. Discardable and reset after `finalize`/`abort`.
+- **`.git`** — the source of truth. Untouched until `finalize`, which writes exactly one commit on `main` (or a configured target). gitagent never adds a `ga/`, `agent/`, or `gitagent/integration/` branch to your repo.
+- **`.gitagent/`** — an ephemeral coordination layer, one subdirectory per feature: detached worktrees, patches, manifests, decisions, audit log. Discardable and reset after `finalize`/`abort`.
 
 `gitagent` does **not** reimplement Git. Proposals are stored as `git diff` patches plus JSON metadata, never as a second history.
 
@@ -24,8 +24,8 @@ Two planes are kept strictly separate:
 | `accept <pid>` | Record the decision "approved". Does **not** apply. |
 | `reject <pid>` | Record "rejected". |
 | `revise <pid>` | Send back to the agent (new `pid` on re-propose). |
-| `integrate` | **Apply** all accepted proposals onto the integration branch. Detects conflicts. |
-| `finalize` | Calls `integrate` (if needed) + creates **one** commit on the current feature branch. |
+| `integrate` | **Apply** all accepted proposals onto the integration worktree. Detects conflicts. |
+| `finalize` | Calls `integrate` (if needed) + creates **one** commit on the target branch (`main`). |
 
 So a minimal flow is: `accept` each → `finalize`. Run `integrate` standalone when you want to see conflicts *before* the final commit.
 
@@ -55,10 +55,10 @@ Requires Python 3.11+ and a working `git` on `PATH`.
 ```bash
 gitagent init
 
-# Start a feature from main (no checkout needed)
+# Start a feature from main (no checkout needed, no branch created)
 gitagent start --feature auth-rate-limiting
 
-# each subagent gets an isolated worktree + ephemeral branch
+# each subagent gets its own detached worktree (no branch added to your repo)
 gitagent spawn --feature auth-rate-limiting --id a_backend --role "implement limiter"
 gitagent spawn --feature auth-rate-limiting --id a_tests --role "write tests"
 
@@ -98,14 +98,14 @@ gitagent start --feature auth-rate-limiting
 gitagent spawn --feature auth-rate-limiting --id a_backend
 # ... a_backend works, proposes, you accept, integrate, finalize ...
 gitagent finalize --feature auth-rate-limiting --message "feat(auth): rate limiting"
-# → 1 commit on main, ga/auth-rate-limiting deleted
+# → 1 commit on main, .gitagent reset
 
 # === Feature B: user profile (parallel) ===
 gitagent start --feature user-profile
 gitagent spawn --feature user-profile --id a_frontend
 # ... a_frontend works, proposes, you accept, integrate, finalize ...
 gitagent finalize --feature user-profile --message "feat(user): profile page"
-# → 1 commit on main, ga/user-profile deleted
+# → 1 commit on main, .gitagent reset
 
 # Both commits are on main. No git merge needed.
 ```
@@ -121,14 +121,14 @@ applying proposals, so cross-feature conflicts surface immediately.
 | Command | Description |
 | --- | --- |
 | `init` | Create `.gitagent/` and add it to `.gitignore`. |
-| `start --feature <name>` | Open a session for a feature. Creates `ga/<name>` if needed. |
+| `start --feature <name>` | Open a session for a feature. No branch is created; a detached integration worktree is prepared. |
 | `status [--feature <name>] [--json]` | Show all features, or detail for one feature. |
 | `list-features [--json]` | List every feature with session/proposal/agent counts. |
 | `log [--json]` | Append-only audit trail (global across features, `log.jsonl`). |
 | `abort --feature <name>` | Discard a feature's session: remove worktrees, reset `.gitagent`. |
-| `spawn --feature <name> --id <id> [--role ...]` | Create an isolated worktree for a subagent. |
+| `spawn --feature <name> --id <id> [--role ...]` | Create an isolated **detached** worktree for a subagent (no branch in your repo). |
 | `list-agents --feature <name> [--json]` | List agents in a feature's session. |
-| `kill <id> --feature <name>` | Remove an agent's worktree and ephemeral branch. |
+| `kill <id> --feature <name>` | Remove an agent's worktree. |
 | `propose --feature <name> --agent <id> --title ...` | Capture worktree changes as a patch proposal. |
 | `proposals --feature <name> [--json]` | List proposals + review state. |
 | `show <id> --feature <name>` | Show a proposal's diff (color). |
@@ -137,18 +137,18 @@ applying proposals, so cross-feature conflicts surface immediately.
 | `reject <id> --feature <name> [--reason ...]` | Reject a proposal (patch not applied). |
 | `revise <id> --feature <name> --feedback ...` | Send a proposal back for another iteration. |
 | `integrate --feature <name> [--json]` | Apply all accepted proposals; detect cross-feature conflicts via 3-way merge. |
-| `finalize --feature <name> --message ... [--target main] [--keep-feature-branch]` | Call `integrate` + produce one commit on the target branch + reset `.gitagent`. **Never pushes.** |
+| `finalize --feature <name> --message ... [--target main]` | Call `integrate` + produce one commit on the target branch + reset `.gitagent`. **Never pushes.** |
 | `install-skill` | Install the bundled `gitagent` agent skill into `~/.agents/skills/gitagent`. |
 
 ## How it works
 
-- **Branchless supervisor**: all commands accept `--feature <name>`. Without it, the current branch is used as default (with a deprecation warning). Your local checkout is never disturbed.
-- **One feature = one session**: identified by name, stored in `.gitagent/features/<key>/`. The `ga/<name>` branch is internal — created at `start`, deleted at `finalize`.
-- **Isolation**: `git worktree add` gives every agent its own `HEAD`, index and working tree while sharing the object store — ideal for parallelism.
+- **Branchless & decoupled supervisor**: all commands require `--feature <name>` (a logical key, not a git branch). gitagent never creates or switches branches in your repository — your local checkout is never disturbed and stays on `main`.
+- **One feature = one session**: identified by name, stored in `.gitagent/features/<key>/`. No `ga/<name>` branch is ever created.
+- **Isolation**: `git worktree add --detach` gives every agent its own `HEAD`, index and working tree (all detached, sharing the object store) — ideal for parallelism and impossible to pollute your refs.
 - **Per-feature storage**: each feature gets its own directory under `.gitagent/features/<key>/`, holding its session, agents, proposals, integration worktree, and locks. The audit log (`log.jsonl`) is global and spans all features.
 - **Proposals as patches**: `git -C <worktree> diff --cached <base_sha> --binary` is stored as `change.patch` and re-applied with `git apply --3way` on the integration worktree. Agent "commits" never pollute the final history.
 - **Live cross-feature conflict detection**: `integrate` resets the integration worktree to the current state of the target branch (default `main`) before applying proposals. If another feature was already finalized on `main`, its changes are visible and 3-way merge conflicts surface immediately.
-- **Single commit on `main`**: `finalize` uses a detached temp worktree on the target branch, squash-merges the integration branch, creates one commit, and updates the target ref via `update-ref`. The user's checkout is untouched. The `ga/<feature>` branch is deleted (use `--keep-feature-branch` to preserve it).
+- **Single commit on `main`**: `finalize` uses a detached temp worktree on the target branch, squash-merges the integration worktree state, creates one commit, and updates the target ref via `update-ref` (under a per-feature lock so concurrent finalizes can't clobber each other). The user's checkout is untouched.
 - **Conflicts**: a conflicting patch is marked `conflict` at `integrate` time — the session stays alive so the superagent can `revise`, fix the integration worktree manually (then re-`accept` + re-`integrate`), or `abort`.
 - **Concurrency**: file locks (`fcntl`) guard review-state writes; `accept` is safe to race (it only marks).
 - **Audit**: every event is appended to `.gitagent/log.jsonl` (parseable by another agent/LLM). Spans all features.
@@ -162,13 +162,13 @@ applying proposals, so cross-feature conflicts surface immediately.
 │   ├── <feature-key>/
 │   │   ├── session.json          # active session: id, feature, base_sha, state
 │   │   ├── agents/<agent-id>/
-│   │   │   ├── meta.json         # role, worktree path, ephemeral branch, state
+│   │   │   ├── meta.json         # role, worktree path, base_sha, state
 │   │   │   └── worktree/         # git worktree for this agent
 │   │   ├── proposals/<proposal-id>/
 │   │   │   ├── manifest.json     # agent, base_sha, files, summary, confidence
 │   │   │   ├── change.patch      # git diff of the proposal
 │   │   │   └── review.json       # pending|accepted|integrated|rejected|revise|conflict + feedback
-│   │   ├── integration/worktree/ # integration branch under construction
+│   │   ├── integration/worktree/ # detached integration worktree under construction
 │   │   └── locks/                # fcntl lockfiles for concurrent writes
 │   └── ...
 └── log.jsonl                     # append-only audit trail (global, all features)
@@ -210,7 +210,7 @@ The skill will be available to agents in **future** sessions. Re-run any of the 
 
 ## Design principle
 
-> `finalize` **never** runs `git push`. It produces a local commit on the **feature branch** and stops. The superagent merges feature branches into `main` with normal git (squash, PR, whatever the team uses).
+> `finalize` **never** runs `git push`. It produces exactly one local commit on the target branch (`main`) and stops. gitagent never creates branches in your repository, so with multiple agents or multiple features there is no branch-switching, no `ga/` pollution, and no risk of an out-of-band commit landing on the wrong ref — everything converges on `main` through `finalize`.
 
 ## License
 

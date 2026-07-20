@@ -28,8 +28,7 @@ def repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def feature_branch(repo: Path) -> Path:
-    """A repo checked out on a feature branch `ga/test-feature`."""
-    _git(["checkout", "-q", "-b", "ga/test-feature"], repo)
+    """A repo ready for gitagent, staying on `main` (branchless model)."""
     return repo
 
 
@@ -38,7 +37,7 @@ def started(feature_branch: Path) -> Path:
     from gitagent import session
 
     session.init(feature_branch)
-    session.start(feature_branch)
+    session.start(feature_branch, feature_name="test-feature")
     return feature_branch
 
 

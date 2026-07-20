@@ -40,11 +40,13 @@ def spawn(
         raise GitAgentError(f"Base ref '{base_ref}' does not resolve to a commit.")
     base_sha = gitwrap.run(["rev-parse", base_ref], cwd=repo).strip()
 
-    branch = f"agent/{agent_id}/{session.id}"
+    # Each agent gets its own DETACHED worktree derived from the session base.
+    # No branch is created for the agent — gitagent never adds branches to the
+    # user's repository, so agents can never pollute or switch the user's refs.
     worktree = p.agents / agent_id / "worktree"
 
     try:
-        gitwrap.worktree_add(worktree, branch, base_ref, cwd=repo)
+        gitwrap.worktree_add_detached(worktree, base_ref, cwd=repo)
     except GitAgentError as exc:
         raise GitAgentError(f"Failed to create worktree for '{agent_id}'.\n{exc}") from exc
 
@@ -53,7 +55,6 @@ def spawn(
         role=role,
         base_sha=base_sha,
         base_ref=base_ref,
-        branch=branch,
         worktree=str(worktree),
         state=AgentState.ACTIVE,
         created_at=store.now(),
@@ -61,7 +62,7 @@ def spawn(
     store.save_agent(p, agent)
     store.log_event(
         p,
-        {"event": "spawn", "agent": agent_id, "base": base_ref, "branch": branch},
+        {"event": "spawn", "agent": agent_id, "base": base_ref, "worktree": str(worktree)},
     )
     return agent
 
@@ -72,7 +73,6 @@ def kill(repo: Path | None = None, *, agent_id: str, feature: str | None = None)
     agent = store.load_agent(p, agent_id)
     with contextlib.suppress(GitAgentError):
         gitwrap.worktree_remove(agent.worktree, force=True, cwd=repo)
-        gitwrap.branch_delete(agent.branch, cwd=repo)
     gitwrap.worktree_prune(cwd=repo)
     agent.state = AgentState.KILLED
     store.save_agent(p, agent)

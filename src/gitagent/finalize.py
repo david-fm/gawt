@@ -5,7 +5,7 @@ from pathlib import Path
 
 from . import gitwrap, review, store
 from .errors import GitAgentError
-from .models import ProposalState
+from .models import ProposalState, Session
 
 
 def finalize(
@@ -15,13 +15,13 @@ def finalize(
     feature: str | None = None,
     target: str | None = None,
     sign: bool = False,
-    keep_feature_branch: bool = False,
 ) -> str:
     """Integrate accepted proposals and produce a single commit on the target branch.
 
     Uses a detached temp worktree based on the target branch so the user's
     local checkout is never disturbed.  The target branch ref is updated via
-    ``git update-ref`` after the commit.
+    ``git update-ref`` after the commit.  The user's own checkout is never
+    switched or modified.
     """
     repo = gitwrap.resolve(repo)
     store.require_init(repo)
@@ -37,8 +37,32 @@ def finalize(
 
     target_branch = target or session.target_branch
 
+    # Serialize finalize for this feature. Two concurrent finalizes (or a
+    # finalize racing an integrate) on the same feature must not both issue
+    # `update-ref refs/heads/<target>` and overwrite each other's commit.
+    with store.lock(p, "finalize"):
+        return _finalize_locked(
+            repo, p, session, message=message,
+            target_branch=target_branch, sign=sign,
+        )
+
+def _finalize_locked(
+    repo: Path,
+    p: store.Paths,
+    session: Session,
+    *,
+    message: str,
+    target_branch: str,
+    sign: bool,
+) -> str:
+    """Body of `finalize`, executed while the feature's `finalize` lock is held.
+
+    The lock guarantees that only one finalize (and thus one `update-ref` to
+    the target branch) runs at a time for a given feature, so concurrent
+    superagents cannot clobber each other's commit on `main`.
+    """
     # --- Phase 4: integrate against live target state --------------------
-    review.integrate(repo, feature=feature)
+    review.integrate(repo, feature=session.feature_key)
 
     integrated = [
         pid
@@ -54,12 +78,17 @@ def finalize(
     # --- Phase 5: land via detached temp worktree -----------------------
     temp_wt = p.root / "_finalize" / session.feature_key
 
+    # The integration worktree is detached (no branch), so its accumulated
+    # state lives at its HEAD.  Merge that SHA rather than a (now-nonexistent)
+    # integration branch.  Resolve the SHA from inside the integration worktree.
+    integration_tip = gitwrap.current_sha(Path(session.integration_worktree))
+
     try:
         gitwrap.worktree_add_detached(temp_wt, target_branch, cwd=repo)
 
         try:
             gitwrap.run(
-                ["merge", "--squash", session.integration_branch],
+                ["merge", "--squash", integration_tip],
                 cwd=temp_wt,
             )
         except GitAgentError as exc:
@@ -85,9 +114,10 @@ def finalize(
             gitwrap.worktree_remove(temp_wt, force=True, cwd=repo)
             gitwrap.worktree_prune(cwd=repo)
 
-    # --- Sync working tree with the updated target ref -------------------
-    # update-ref moved the branch pointer but the working tree may be stale.
-    # Reset hard to the new commit so the user sees the landed files.
+    # The target branch ref has been advanced to `sha` via update-ref.  We do
+    # NOT touch the user's working tree or checkout — the user stays wherever
+    # they were (e.g. on `main`).  If they happen to already be on the target
+    # branch, refresh their index/working tree to the new commit.
     cur_branch = gitwrap.current_branch(repo)
     if cur_branch == target_branch:
         gitwrap.run(["reset", "--hard", sha], cwd=repo)
@@ -103,15 +133,6 @@ def finalize(
             "target_branch": target_branch,
         },
     )
-
-    # --- Cleanup: always leave user on the target branch -----------------
-    cur_branch = gitwrap.current_branch(repo)
-    if cur_branch != target_branch:
-        gitwrap.run(["checkout", "-q", target_branch], cwd=repo)
-
-    if not keep_feature_branch:
-        with __import__("contextlib").suppress(GitAgentError):
-            gitwrap.branch_delete(session.branch, force=True, cwd=repo)
 
     # Remove .gitagent/features/<key>/ (keep global log).
     shutil.rmtree(p.feature, ignore_errors=True)
