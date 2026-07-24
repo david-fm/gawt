@@ -1,6 +1,6 @@
 ---
 name: gitagent
-description: Use this skill when you (or another agent you supervise) need to coordinate multi-agent coding work over Git — spawning isolated subagent worktrees per feature, collecting proposals as patches, accepting/rejecting/revising them, and producing one clean commit on main. Triggers on "gitagent", "agent worktree", "multi-agent git workflow", "isolate subagent work", "consolidate agent changes into one commit", "spawn an agent for X", "review proposal", "agent proposal", "multi-feature", "parallel features". Do NOT use for: general git questions (use regular git), single-developer workflows, or non-agent coordination tasks.
+description: 'Use this skill when you (or another agent you supervise) need to coordinate multi-agent coding work over Git — spawning isolated subagent worktrees per feature, collecting proposals as patches, accepting/rejecting/revising them, and producing one clean commit on main. Triggers on "gitagent", "agent worktree", "multi-agent git workflow", "isolate subagent work", "consolidate agent changes into one commit", "spawn an agent for X", "review proposal", "agent proposal", "multi-feature", "parallel features". Do NOT use for: general git questions (use regular git), single-developer workflows, or non-agent coordination tasks.'
 ---
 
 # gitagent
