@@ -63,6 +63,8 @@ gitagent spawn --feature auth-rate-limiting --id a_backend --role "implement lim
 gitagent spawn --feature auth-rate-limiting --id a_tests --role "write tests"
 
 # subagents work in their own folders, then propose (no commit to .git)
+# `propose` also works from inside the agent's worktree; --feature/--agent
+# are inferred from cwd if omitted (explicit flags always win).
 gitagent propose --feature auth-rate-limiting --agent a_backend \
                  --title "Token bucket limiter" --confidence 0.85
 gitagent propose --feature auth-rate-limiting --agent a_tests \

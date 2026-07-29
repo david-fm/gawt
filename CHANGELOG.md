@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-07-20
+## [0.4.2] - 2026-07-29
+
+### Added
+- **`propose` works from inside an agent's worktree.** Subagents no longer need to `cd` to the main repo to submit a proposal. The main repo is resolved via `git rev-parse --git-common-dir`, so this works from any linked worktree, subdirectory, or the worktree itself.
+- **Automatic `--feature` / `--agent` inference in `propose`.** When a subagent runs `propose` from inside `.gitagent/features/<key>/agents/<id>/worktree/` (or any subdirectory), `feature` and `agent_id` are inferred from the cwd if they are not passed on the command line. Explicit flags always win. The inference emits a one-line notice to stderr naming the resolved feature/agent so silent mistakes are visible.
+- `gitwrap.git_common_dir()` and `gitwrap.main_repo_root()` helpers for resolving the shared `git` directory and the main repo root from any cwd (linked worktree, subdir, or main checkout).
+- 5 new tests in `tests/test_proposals.py` covering inference from the worktree, from a subdir, failure from the integration worktree, failure from the main repo, and explicit-override-beats-inference.
+
+### Changed
+- `proposals.propose()` now accepts `agent_id: str | None` (was: required) and an optional `cwd: Path | None` for tests; defaults to `Path.cwd()`.
+- `propose` audit log entries gain an `inferred` boolean for observability.
+
+### Notes
+- Only `propose` infers from cwd. Every other command (`init`, `start`, `spawn`, `kill`, `proposals`, `show`, `diff`, `accept`, `reject`, `revise`, `integrate`, `finalize`) still requires explicit `--feature` and must be run from the main repo. This keeps the supervisor's surface explicit and avoids silently writing to the wrong feature from a stray cwd.
+- Integration worktrees deliberately fail inference (no `agents/<id>/meta.json` under their cwd) so the supervisor cannot accidentally propose into its own integration worktree.
+
+## [0.4.1] - 2026-07-29
+
+### Fixed
+- Quoted `SKILL.md` frontmatter `description` to fix YAML parsing on stricter parsers.
+
+
 
 ### Changed (BREAKING)
 - **gitagent is now fully decoupled from the user's Git branches.** It no longer creates, checks out, or deletes any branch in your repository (`ga/<feature>`, `agent/<id>/<sid>`, or `gitagent/integration/...`). Every command requires `--feature <name>` (a logical key, not a Git branch). Your local checkout stays on `main` throughout.

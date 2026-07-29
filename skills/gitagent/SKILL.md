@@ -43,7 +43,7 @@ Works inside a single isolated worktree. Cannot see other agents' work (even les
 - Run `gitagent propose --agent <id> --title "..."` when done
 - If sent back with `revise`, iterate and `propose` again (a new `pid` is generated each time)
 - Never run `gitagent init` / `start` / `finalize` / `accept` / `integrate` — those are supervisor-only
-- The proposal lands in **the current feature's session**, not the main repo. Subagents don't care which branch the supervisor is on — they just `propose` and the supervisor's checkout determines where the session lives.
+- The proposal lands in **the active feature's session**. The subagent may run `propose` from inside its worktree; `feature` and `agent` are inferred from the cwd if not passed on the command line. Explicit `--feature` and `--agent` flags always win.
 
 **Mindset:** your worktree is disposable. The supervisor will `kill` it or let it be torn down at `finalize`. Don't put anything important there that isn't also captured in a proposal.
 
@@ -381,21 +381,27 @@ You are spawned. You got a worktree path. Now what?
 cd /path/to/repo/.gitagent/features/<feature-key>/agents/<your-id>/worktree
 
 # 2. explore the codebase, make your changes
-#    ... edit files ...
+# ... edit files ...
 
 # 3. check what you've changed
 git status
 git diff HEAD   # this is exactly what `gitagent propose` will capture
 
-# 4. submit your proposal (run from the repo root, not the worktree)
-cd /path/to/repo
-gitagent propose --agent <your-id> --title "Short summary" \
-                 --summary "Longer description" --confidence 0.85
+# 4. submit your proposal. `propose` works from inside the worktree: it
+#    resolves the main repo via `git rev-parse --git-common-dir` and
+#    infers <feature-key> and <your-id> from the cwd if you don't pass
+#    them. Explicit flags always win.
+gitagent propose --title "Short summary" --confidence 0.85
+# OR explicitly, from anywhere (inside or outside the worktree):
+gitagent propose --feature <key> --agent <your-id> --title "..." \
+                 --summary "..." --confidence 0.85
 ```
 
 **Important:** the worktree is a real `git worktree`. You can `git commit` inside it for your own scratch organization — but those commits are local to your worktree and **will not** end up in the final history. The supervisor only sees your `propose`'d patch (which is `git diff` of your worktree vs the base you were spawned on).
 
 If you `git commit` inside the worktree and then `propose`, the committed changes still appear in the diff (they're in the tree, just not in HEAD). That's fine. If you want a clean patch, leave things uncommitted — `propose` will diff against your base SHA regardless of staging.
+
+**Inference scope:** only `propose` infers `--feature`/`--agent` from cwd. Every other command (`init`, `start`, `spawn`, `kill`, `proposals`, `show`, `diff`, `accept`, `reject`, `revise`, `integrate`, `finalize`) still requires explicit `--feature` and must be run from the main repo. When `propose` infers, it prints a one-line notice to stderr naming the resolved feature/agent so silent mistakes are visible.
 
 ---
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +19,65 @@ def _resolve(repo: Path | None, feature: str | None = None) -> tuple[Path, store
     return repo, p
 
 
+def _infer_from_cwd(cwd: Path) -> tuple[str, str] | None:
+    """Infer (feature_key, agent_id) if cwd is inside an agent worktree.
+
+    Detection looks for an ancestor matching
+    ``<repo>/.gitagent/features/<key>/agents/<id>/worktree`` whose
+    ``meta.json`` exists. Returns None for the integration worktree
+    (no ``agents/`` segment) and for any other location.
+    """
+    try:
+        repo = gitwrap.main_repo_root(cwd)
+    except GitAgentError:
+        return None
+    if not store.initialized(repo):
+        return None
+    features_dir = (repo / ".gitagent" / "features").resolve()
+    cur = Path(cwd).resolve()
+    for parent in [cur, *cur.parents]:
+        try:
+            rel = parent.relative_to(features_dir)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if len(parts) >= 3 and parts[1] == "agents" and (parent / "meta.json").exists():
+            return parts[0], parts[2]
+    return None
+
+
 def propose(
     repo: Path | None = None,
     *,
-    agent_id: str,
+    agent_id: str | None = None,
     title: str,
     summary: str = "",
     confidence: float | None = None,
     feature: str | None = None,
+    cwd: Path | None = None,
 ) -> Proposal:
+    inferred: tuple[str, str] | None = None
+    if feature is None and agent_id is None:
+        inferred = _infer_from_cwd(cwd if cwd is not None else Path.cwd())
+        if inferred is not None:
+            feature, agent_id = inferred
+            print(
+                f"[dim]gitagent:[/dim] inferred feature={feature!r} agent={agent_id!r} "
+                f"from cwd; pass --feature/--agent to override.",
+                file=sys.stderr,
+            )
+    if feature is None:
+        raise GitAgentError(
+            "A feature name is required. Pass --feature <name> explicitly, "
+            "or run propose from inside an agent worktree "
+            "(.gitagent/features/<key>/agents/<id>/worktree)."
+        )
+    if agent_id is None:
+        raise GitAgentError(
+            "An agent id is required. Pass --agent <id> explicitly, "
+            "or run propose from inside an agent worktree."
+        )
+
     repo, p = _resolve(repo, feature)
     session = store.require_session(p)
     if session.state.value not in ("open", "integrating"):
@@ -71,6 +122,7 @@ def propose(
             "agent": agent_id,
             "title": title,
             "files": files,
+            "inferred": bool(inferred),
         },
     )
     return proposal

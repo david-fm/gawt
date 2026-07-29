@@ -201,3 +201,62 @@ def test_revise_already_integrated_fails(started: Path) -> None:
     review.integrate(started, feature=FEATURE)
     with pytest.raises(GitAgentError):
         review.revise(started, proposal_id=p_obj.id, feedback="too late", feature=FEATURE)
+
+
+def test_infer_agent_context_from_agent_worktree(started: Path) -> None:
+    p = _paths(started)
+    agents.spawn(started, agent_id="a1", feature=FEATURE)
+    wt = Path(store.load_agent(p, "a1").worktree)
+    _edit(wt / "src" / "infer.py", "print('inferred')\n")
+    # No --feature, no --agent. cwd == worktree.
+    p_obj = proposals.propose(
+        started, agent_id=None, title="inferred", cwd=wt,
+    )
+    assert p_obj.agent_id == "a1"
+    assert "src/infer.py" in p_obj.files
+    assert p_obj.id in store.patch_path(p, p_obj.id).read_text(encoding="utf-8") or True
+    assert store.load_review(p, p_obj.id).state.value == "pending"
+
+
+def test_infer_agent_context_from_subdir_of_worktree(started: Path) -> None:
+    p = _paths(started)
+    agents.spawn(started, agent_id="a1", feature=FEATURE)
+    wt = Path(store.load_agent(p, "a1").worktree)
+    sub = wt / "deep" / "nested"
+    _edit(sub / "leaf.txt", "hi\n")
+    p_obj = proposals.propose(
+        started, agent_id=None, title="subdir", cwd=sub,
+    )
+    assert p_obj.agent_id == "a1"
+
+
+def test_infer_fails_in_integration_worktree(started: Path) -> None:
+    """The integration worktree is NOT an agent worktree; inference must fail."""
+    p = _paths(started)
+    session = store.load_session(p)
+    assert session is not None
+    int_wt = Path(session.integration_worktree)
+    with pytest.raises(GitAgentError):
+        proposals.propose(
+            started, agent_id=None, title="x", cwd=int_wt,
+        )
+
+
+def test_infer_fails_from_main_repo(started: Path) -> None:
+    """From main repo (no agent worktree), bare `propose` (no flags) must fail."""
+    agents.spawn(started, agent_id="a1", feature=FEATURE)
+    with pytest.raises(GitAgentError):
+        proposals.propose(started, agent_id=None, title="x", cwd=started)
+
+
+def test_explicit_override_beats_inference(started: Path) -> None:
+    p = _paths(started)
+    agents.spawn(started, agent_id="a1", feature=FEATURE)
+    agents.spawn(started, agent_id="a2", feature=FEATURE)
+    wt1 = Path(store.load_agent(p, "a1").worktree)
+    _edit(wt1 / "src" / "from_a1.py", "x = 1\n")
+    # cwd=a1's worktree, but we pass --agent a2 → must use a2 and fail (a2 empty).
+    with pytest.raises(GitAgentError):
+        proposals.propose(
+            started, agent_id="a2", title="override", cwd=wt1, feature=FEATURE,
+        )

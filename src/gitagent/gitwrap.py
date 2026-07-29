@@ -20,6 +20,42 @@ def repo_root(cwd: Path | str | None = None) -> Path:
     return Path(out.strip())
 
 
+def git_common_dir(cwd: Path | str | None = None) -> Path:
+    """Return the shared ``.git`` directory of the main repository.
+
+    From a linked worktree this points to the **main** repo's ``.git``,
+    not the per-worktree metadata directory.
+    """
+    try:
+        out = _run(["rev-parse", "--git-common-dir"], cwd=cwd, check=True)
+    except GitAgentError as exc:
+        raise GitAgentError("Not inside a git repository.") from exc
+    p = Path(out.strip())
+    if not p.is_absolute():
+        p = Path(cwd).resolve() / p if cwd is not None else Path.cwd().resolve() / p
+    return p
+
+
+def main_repo_root(cwd: Path | str | None = None) -> Path:
+    """Return the main repository's working tree root, regardless of cwd.
+
+    Walks up from ``--git-common-dir`` to find the repo root (the directory
+    that contains ``.git`` or is the root of a bare repo's parent). Works
+    identically from main, a linked worktree, or any subdir of either.
+    """
+    common = git_common_dir(cwd)
+    cur = common.resolve()
+    while cur != cur.parent:
+        if (cur / ".git").exists() or cur.name == ".git":
+            # Either <repo>/.git (resolved by going up one) or a bare repo root.
+            if cur.name == ".git":
+                return cur.parent
+            return cur
+        cur = cur.parent
+    # Bare repo: common dir IS the repo root.
+    return common
+
+
 def run(args: list[str], cwd: Path | str | None = None, *, check: bool = True) -> str:
     return _run(args, cwd=cwd, check=check)
 
