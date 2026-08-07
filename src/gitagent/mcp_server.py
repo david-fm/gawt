@@ -7,7 +7,7 @@ from __future__ import annotations
 from mcp.server import MCPServer
 
 from . import agents, edits, inbox, intents, session
-from .db import get_db, reset_db
+from .db import get_db
 from .errors import GitAgentError
 
 server = MCPServer("gitagent", version="0.5.0")

@@ -1,9 +1,7 @@
 """Shared fixtures for gitagent v0.5.0 tests."""
 from __future__ import annotations
 
-import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -52,12 +50,12 @@ def repo_with_gitagent(tmp_repo: Path, tmp_db: Database):
     Patches get_db to return the test db, and sets up the repo structure
     that session.py expects.
     """
-    import gitagent.db as db_mod
-    import gitagent.session as session_mod
     import gitagent.agents as agents_mod
+    import gitagent.db as db_mod
     import gitagent.edits as edits_mod
     import gitagent.inbox as inbox_mod
     import gitagent.intents as intents_mod
+    import gitagent.session as session_mod
 
     # Patch get_db to return our test db
     db_mod.get_db = lambda path=None: tmp_db

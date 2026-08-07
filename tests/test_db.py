@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gitagent.db import Database, CURRENT_VERSION
+from gitagent.db import CURRENT_VERSION, Database
 
 
 def test_schema_creation(tmp_path: Path):

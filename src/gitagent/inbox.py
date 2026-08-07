@@ -1,15 +1,14 @@
 """Inbox: check_inbox, send_message for inter-agent coordination."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from .db import Database, get_db
-from .errors import GitAgentError
 from .agents import validate_agent
+from .db import Database, get_db
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _send_inbox(

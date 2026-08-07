@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from gitagent.errors import GitAgentError
 from gitagent import session
+from gitagent.errors import GitAgentError
 
 
 def test_start_and_get_session(repo_with_gitagent):

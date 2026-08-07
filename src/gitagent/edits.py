@@ -8,19 +8,18 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from . import gitwrap
+from .agents import validate_agent
 from .db import Database, get_db
 from .errors import GitAgentError
-from .agents import validate_agent
 from .intents import get_current_intent
 from .session import get_session
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _worktree(db: Database | None = None) -> Path:
@@ -75,7 +74,7 @@ def _detect_conflicts(
         # Check if within the conflict window
         try:
             edit_ts = datetime.fromisoformat(row["ts"])
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             diff = (now - edit_ts).total_seconds()
             if diff <= window_seconds:
                 other = row["agent_id"]

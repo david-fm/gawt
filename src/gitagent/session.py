@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import secrets
 import shutil
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import gitwrap
@@ -17,7 +17,7 @@ from .errors import GitAgentError
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _sid() -> str:
@@ -132,7 +132,12 @@ def finalize_session(
         "SELECT id FROM agents WHERE session_id = ? AND ended_at IS NULL",
         (session["id"],),
     )
-    # TODO: emit warning to stderr if active agents exist
+    if active:
+        import sys
+        print(
+            f"WARNING: {len(active)} agent(s) still active at finalize time.",
+            file=sys.stderr,
+        )
 
     # Phase 1: commit on the worktree
     gitwrap.run(["add", "-A"], cwd=wt)

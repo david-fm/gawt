@@ -5,15 +5,14 @@ agent has a single "current intent" at any time.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from .db import Database, get_db
-from .errors import GitAgentError
 from .agents import validate_agent
+from .db import Database, get_db
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def start_intent(agent_id: str, intent: str, db: Database | None = None) -> dict:

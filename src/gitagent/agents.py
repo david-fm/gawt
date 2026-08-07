@@ -6,7 +6,7 @@ its id explicitly on every subsequent tool call — no cwd/env inference.
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .db import Database, get_db
 from .errors import GitAgentError
@@ -14,7 +14,7 @@ from .session import get_session
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _aid() -> str:
