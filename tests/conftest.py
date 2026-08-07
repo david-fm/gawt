@@ -14,7 +14,7 @@ def tmp_repo(tmp_path: Path):
     """Create a temporary git repo with an initial commit."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
         cwd=str(repo), check=True, capture_output=True,
