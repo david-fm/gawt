@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+- **MCP-only.** CLI removed. All operations exposed as MCP tools over stdio.
+- **Single global worktree.** Replaces per-agent worktrees. Features are serialized; parallelism lives in agents sharing one worktree.
+- **SQLite state store.** Replaces JSON files. Tracks sessions, agents, intents, edits, and inbox with full attribution.
+- **Live edit tracking.** Every `edit_file`/`write_file` records `(agent_id, file, intent, ts)` in SQLite.
+- **Semantic intents.** `start_intent`/`repurpose` annotate the edit log with purpose.
+- **Inbox coordination.** Best-effort conflict notifications between agents. No file locks.
+- **Atomic writes.** All writes go through temp + `os.replace` (POSIX-atomic).
+- **Agent id per call.** Agent passes its `agent_id` explicitly on every tool call. No cwd/env inference.
+- Removed: `cli.py`, `store.py`, `proposals.py`, `review.py`, `finalize.py` (replaced by `mcp_server.py`, `db.py`, `session.py`, `agents.py`, `intents.py`, `edits.py`, `inbox.py`).
+- Removed: `typer`, `rich` dependencies. Added: `mcp>=2.0`.
+- Removed: `propose`, `spawn`, `integrate`, `accept`, `reject`, `revise`, `init`, `status`, `list-features`, `log`, `kill`, `install-skill` CLI commands.
+- New entry point: `gitagent-mcp` (was `gitagent`).
+
+### Added
+- `db.py` — SQLite wrapper with `PRAGMA user_version` migrations.
+- `session.py` — `start_session`, `finalize_session`, `abort_session`, `get_session`.
+- `agents.py` — `register_agent` (auto `a_<hex>`), `unregister_agent`, `list_agents`, `validate_agent`.
+- `intents.py` — `start_intent`, `repurpose`, `get_current_intent`.
+- `edits.py` — `edit_file`, `write_file`, `read_file`, `delete_file` with atomic writes and conflict detection.
+- `inbox.py` — `check_inbox`, `send_message`.
+- `mcp_server.py` — FastMCP entrypoint (stdio transport).
+- 39 tests covering all new modules.
+- `PLAN.md` — full design document for v0.5.0.
+
 ## [0.4.2] - 2026-07-29
 
 ### Added

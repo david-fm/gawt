@@ -1,91 +1,95 @@
+"""Agent lifecycle: register, unregister, list, validate.
+
+Agents are auto-assigned ``a_<hex>`` ids at registration. The agent passes
+its id explicitly on every subsequent tool call — no cwd/env inference.
+"""
 from __future__ import annotations
 
-import contextlib
-from pathlib import Path
-from typing import Any
+import secrets
+from datetime import datetime, timezone
 
-from . import gitwrap, store
+from .db import Database, get_db
 from .errors import GitAgentError
-from .models import Agent, AgentState
+from .session import get_session
 
 
-def _resolve(repo: Path | None, feature: str | None = None) -> tuple[Path, store.Paths]:
-    repo = gitwrap.resolve(repo)
-    if feature is not None:
-        p = store.paths_for_feature(repo, feature)
-    else:
-        p = store.current_feature_paths(repo)
-    return repo, p
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def spawn(
-    repo: Path | None = None,
-    *,
-    agent_id: str,
-    base: str | None = None,
-    role: str = "",
-    feature: str | None = None,
-) -> Agent:
-    repo, p = _resolve(repo, feature)
-    session = store.require_session(p)
-    if session.state.value not in ("open", "integrating"):
-        raise GitAgentError(f"Session is {session.state.value}; cannot spawn agents.")
-    if not agent_id:
-        raise GitAgentError("Agent id cannot be empty.")
-    if agent_id in store.agent_ids(p):
-        raise GitAgentError(f"Agent '{agent_id}' already exists.")
+def _aid() -> str:
+    return f"a_{secrets.token_hex(4)}"
 
-    base_ref = base or session.base_sha
-    if not gitwrap.run_ok(["rev-parse", "--verify", f"{base_ref}^{{commit}}"], cwd=repo):
-        raise GitAgentError(f"Base ref '{base_ref}' does not resolve to a commit.")
-    base_sha = gitwrap.run(["rev-parse", base_ref], cwd=repo).strip()
 
-    # Each agent gets its own DETACHED worktree derived from the session base.
-    # No branch is created for the agent — gitagent never adds branches to the
-    # user's repository, so agents can never pollute or switch the user's refs.
-    worktree = p.agents / agent_id / "worktree"
+def register_agent(role: str = "", db: Database | None = None) -> dict:
+    """Register a new agent in the current open session.
 
-    try:
-        gitwrap.worktree_add_detached(worktree, base_ref, cwd=repo)
-    except GitAgentError as exc:
-        raise GitAgentError(f"Failed to create worktree for '{agent_id}'.\n{exc}") from exc
+    Returns ``{agent_id}``.
+    """
+    db = db or get_db()
+    session = get_session(db)
+    if session is None:
+        raise GitAgentError("No open session. Start one first.")
 
-    agent = Agent(
-        id=agent_id,
-        role=role,
-        base_sha=base_sha,
-        base_ref=base_ref,
-        worktree=str(worktree),
-        state=AgentState.ACTIVE,
-        created_at=store.now(),
+    aid = _aid()
+    now = _now()
+
+    db.execute(
+        """INSERT INTO agents (id, session_id, role, started_at)
+           VALUES (?, ?, ?, ?)""",
+        (aid, session["id"], role, now),
     )
-    store.save_agent(p, agent)
-    store.log_event(
-        p,
-        {"event": "spawn", "agent": agent_id, "base": base_ref, "worktree": str(worktree)},
+    db.commit()
+
+    return {"agent_id": aid}
+
+
+def unregister_agent(agent_id: str, db: Database | None = None) -> None:
+    """Mark an agent as ended."""
+    db = db or get_db()
+    now = _now()
+    db.execute(
+        "UPDATE agents SET ended_at = ? WHERE id = ?",
+        (now, agent_id),
     )
-    return agent
+    db.commit()
 
 
-def kill(repo: Path | None = None, *, agent_id: str, feature: str | None = None) -> None:
-    repo, p = _resolve(repo, feature)
-    store.require_session(p)
-    agent = store.load_agent(p, agent_id)
-    with contextlib.suppress(GitAgentError):
-        gitwrap.worktree_remove(agent.worktree, force=True, cwd=repo)
-    gitwrap.worktree_prune(cwd=repo)
-    agent.state = AgentState.KILLED
-    store.save_agent(p, agent)
-    store.log_event(p, {"event": "kill", "agent": agent_id})
+def list_agents(db: Database | None = None) -> list[dict]:
+    """List all agents in the current open session."""
+    db = db or get_db()
+    session = get_session(db)
+    if session is None:
+        return []
+
+    rows = db.fetchall(
+        "SELECT * FROM agents WHERE session_id = ? ORDER BY started_at",
+        (session["id"],),
+    )
+    return [dict(r) for r in rows]
 
 
-def list_agents(repo: Path | None = None, *, feature: str | None = None) -> list[dict[str, Any]]:
-    repo, p = _resolve(repo, feature)
-    store.require_session(p)
-    out: list[dict[str, Any]] = []
-    for aid in store.agent_ids(p):
-        try:
-            out.append(store.load_agent(p, aid).to_dict())
-        except GitAgentError:
-            continue
-    return out
+def validate_agent(agent_id: str, db: Database | None = None) -> dict:
+    """Validate that agent_id is active in the current open session.
+
+    Returns the agent row as a dict. Raises on any failure.
+    """
+    db = db or get_db()
+    session = get_session(db)
+    if session is None:
+        raise GitAgentError("No open session.")
+
+    row = db.fetchone(
+        "SELECT * FROM agents WHERE id = ? AND session_id = ?",
+        (agent_id, session["id"]),
+    )
+    if row is None:
+        raise GitAgentError(
+            f"Agent '{agent_id}' not found in session '{session['id']}'. "
+            "Register first with register_agent."
+        )
+    if row["ended_at"] is not None:
+        raise GitAgentError(
+            f"Agent '{agent_id}' is ended (ended_at={row['ended_at']})."
+        )
+    return dict(row)

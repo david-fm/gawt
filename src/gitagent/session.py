@@ -1,229 +1,223 @@
+"""Session lifecycle: start, finalize, abort, get.
+
+A session owns a single global worktree. Only one session can be open at a
+time. Features are serialized; parallelism lives in the agents, not in
+worktrees.
+"""
 from __future__ import annotations
 
 import secrets
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from . import feature, gitwrap, store
+from . import gitwrap
+from .db import Database, get_db
 from .errors import GitAgentError
-from .models import ProposalState, Session, SessionState
-
-GITIGNORE_ENTRY = ".gitagent/"
-GITIGNORE_FEATURES = ".gitagent/features/"
 
 
-def init(repo: Path | None = None) -> None:
-    repo = gitwrap.resolve(repo)
-    if store.initialized(repo):
-        raise GitAgentError("gitagent is already initialized in this repository.")
-    gitwrap.repo_root(repo)
-    root = repo / store.GITAGENT_DIR
-    root.mkdir(parents=True, exist_ok=True)
-    (root / store.FEATURES_DIR).mkdir(parents=True, exist_ok=True)
-    _ensure_gitignored(repo)
-    log_path = store.global_log_path(repo)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    store.log_event_at(log_path, {"event": "init"})
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _ensure_gitignored(repo: Path) -> None:
-    gi = repo / ".gitignore"
-    needed = [GITIGNORE_ENTRY]
-    if gi.exists():
-        lines = gi.read_text(encoding="utf-8").splitlines()
-        with gi.open("a", encoding="utf-8") as fh:
-            for entry in needed:
-                if entry not in lines:
-                    fh.write(entry + "\n")
-    else:
-        gi.write_text("\n".join(needed) + "\n", encoding="utf-8")
+def _sid() -> str:
+    return f"s_{secrets.token_hex(4)}"
 
 
-def start(
-    repo: Path | None = None,
-    *,
-    feature_name: str | None = None,
+def get_session(db: Database | None = None) -> dict | None:
+    """Return the currently open session as a dict, or None."""
+    db = db or get_db()
+    row = db.fetchone("SELECT * FROM session WHERE state = 'open'")
+    return dict(row) if row else None
+
+
+def start_session(
+    feature: str,
     target_branch: str = "main",
-) -> Session:
-    """Open a session for a feature.
+    db: Database | None = None,
+    conflict_window_seconds: int = 30,
+) -> dict:
+    """Create a new session with a detached worktree.
 
-    gitagent is fully decoupled from the user's branches: no ``ga/<feature>``
-    branch is created and the user's current checkout is never changed.  The
-    feature is a logical key (a directory under ``.gitagent/features/<key>/``).
-    All work happens in detached worktrees derived from *target_branch*.  The
-    target branch is only touched by ``finalize``, which writes one commit.
+    Fails if a session is already open.
+
+    Returns ``{session_id, worktree, base_sha}``.
     """
-    repo = gitwrap.resolve(repo)
-    store.require_init(repo)
+    db = db or get_db()
 
-    if feature_name is None:
+    existing = get_session(db)
+    if existing is not None:
         raise GitAgentError(
-            "A feature name is required.  Pass --feature <name> explicitly."
+            f"Session already open (id={existing['id']}, feature={existing['feature']}). "
+            "Finalize or abort it first."
         )
 
-    feature_key = feature.slugify(feature_name)
-    p = store.paths(repo, feature_key)
-    store.ensure_dirs(p)
-    if store.load_session(p) is not None:
-        raise GitAgentError(
-            f"A session is already active for this feature ({feature_key}). "
-            f"Run `gitagent abort` to discard, or `gitagent status` to inspect."
-        )
+    repo = gitwrap.repo_root()
+    base_sha = gitwrap.current_sha(cwd=repo)
 
-    # Base the session on the live target branch HEAD.  We never create a
-    # branch for the feature; the base SHA anchors every detached worktree.
-    base_sha = gitwrap.run(["rev-parse", target_branch], cwd=repo).strip()
+    wt_path = repo / ".gitagent" / "worktree"
+    if wt_path.exists():
+        shutil.rmtree(wt_path, ignore_errors=True)
 
-    sid = "s_" + secrets.token_hex(4)
-    integration_branch = f"gitagent/integration/{feature_key}/{sid}"
-    integration_worktree = p.integration / "worktree"
+    gitwrap.worktree_add_detached(wt_path, base_sha, cwd=repo)
 
-    # Detached worktree on the target branch — no branch is created for it.
-    gitwrap.worktree_add_detached(integration_worktree, target_branch, cwd=repo)
+    sid = _sid()
+    now = _now()
 
-    session = Session(
-        id=sid,
-        feature=feature.name_from_branch(feature_name),
-        feature_key=feature_key,
-        base_sha=base_sha,
-        integration_branch=integration_branch,
-        integration_worktree=str(integration_worktree),
-        target_branch=target_branch,
-        state=SessionState.OPEN,
-        created_at=store.now(),
-        updated_at=store.now(),
+    db.execute(
+        """INSERT INTO session
+           (id, feature, target_branch, base_sha, worktree, state, created_at)
+           VALUES (?, ?, ?, ?, ?, 'open', ?)""",
+        (sid, feature, target_branch, base_sha, str(wt_path), now),
     )
-    store.save_session(p, session)
-    store.log_event(
-        p,
-        {
-            "event": "start",
-            "feature_key": feature_key,
-            "feature": session.feature,
-            "session": sid,
-            "base_sha": base_sha,
-            "target_branch": target_branch,
-        },
-    )
-    return session
+    db.commit()
+
+    return {"session_id": sid, "worktree": str(wt_path), "base_sha": base_sha}
 
 
-def _resolve_paths_for(
-    repo: Path,
-    feature_name: str | None = None,
-) -> store.Paths:
-    """Resolve Paths, using *feature_name* or falling back to the current branch."""
-    if feature_name is not None:
-        return store.paths_for_feature(repo, feature_name)
-    return store.current_feature_paths(repo)
-
-
-def status_snapshot(
-    repo: Path | None = None,
-    *,
-    feature_name: str | None = None,
-) -> dict[str, Any]:
-    repo = gitwrap.resolve(repo)
-    store.require_init(repo)
-
-    if feature_name is not None:
-        p = store.paths_for_feature(repo, feature_name)
-        session = store.load_session(p)
-        return _snapshot_for_paths(p, session)
-
-    # No feature specified: show a summary of all features.
-    return {
-        "initialized": True,
-        "session": None,
-        "branch": gitwrap.current_branch(repo),
-        "features": _features_summary(repo),
-    }
-
-
-def _snapshot_for_paths(p: store.Paths, session: Session | None) -> dict[str, Any]:
+def abort_session(db: Database | None = None) -> None:
+    """Remove the worktree and mark the session aborted."""
+    db = db or get_db()
+    session = get_session(db)
     if session is None:
-        return {
-            "initialized": True,
-            "session": None,
-            "branch": gitwrap.current_branch(p.root.parent),
-            "features": _features_summary(p.root.parent),
-        }
+        raise GitAgentError("No open session to abort.")
 
-    agents: list[dict[str, Any]] = []
-    for aid in store.agent_ids(p):
-        try:
-            a = store.load_agent(p, aid)
-            agents.append(a.to_dict())
-        except GitAgentError:
-            continue
+    repo = gitwrap.repo_root()
+    wt = Path(session["worktree"])
 
-    proposals: list[dict[str, Any]] = []
-    for pid in store.proposal_ids(p):
-        try:
-            prop = store.load_proposal(p, pid)
-            rev = store.load_review(p, pid)
-        except GitAgentError:
-            continue
-        proposals.append({"manifest": prop.to_dict(), "review": rev.to_dict()})
+    gitwrap.worktree_remove(wt, force=True, cwd=repo)
+    gitwrap.worktree_prune(cwd=repo)
 
-    integrated = sum(
-        1
-        for pid in store.proposal_ids(p)
-        if store.load_review(p, pid).state == ProposalState.INTEGRATED
+    now = _now()
+    db.execute(
+        "UPDATE session SET state = 'aborted', ended_at = ? WHERE id = ?",
+        (now, session["id"]),
     )
-    return {
-        "initialized": True,
-        "branch": gitwrap.current_branch(p.root.parent),
-        "session": session.to_dict(),
-        "agents": agents,
-        "proposals": proposals,
-        "integration": {
-            "branch": session.integration_branch,
-            "worktree": session.integration_worktree,
-            "base_sha": session.base_sha,
-            "integrated_count": integrated,
-        },
-        "features": _features_summary(p.root.parent),
-    }
+    db.commit()
 
 
-def _features_summary(repo: Path) -> list[dict[str, Any]]:
-    return features_summary(repo)
+def finalize_session(
+    message: str,
+    *,
+    sign: bool = False,
+    db: Database | None = None,
+) -> str:
+    """Commit worktree state onto the target branch.
 
+    Flow:
+      1. git add -A + commit on the worktree
+      2. create detached temp worktree on target_branch
+      3. squash-merge the worktree commit into temp
+      4. commit on temp
+      5. git update-ref to advance target_branch
+      6. clean up both worktrees
+      7. mark session finalized
 
-def features_summary(repo: Path) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for key in store.list_features(repo):
-        p = store.paths(repo, key)
-        s = store.load_session(p)
-        if s is None:
-            out.append({"key": key, "session": None, "proposals": 0, "agents": 0})
-            continue
-        out.append(
-            {
-        "key": key,
-            "session": s.id,
-            "feature": s.feature,
-            "state": s.state.value,
-            "target": s.target_branch,
-            "integration_branch": s.integration_branch,
-                "proposals": len(store.proposal_ids(p)),
-                "agents": len(store.agent_ids(p)),
-            }
+    Returns the final commit SHA on target_branch.
+    """
+    db = db or get_db()
+    session = get_session(db)
+    if session is None:
+        raise GitAgentError("No open session to finalize.")
+
+    repo = gitwrap.repo_root()
+    wt = Path(session["worktree"])
+    target_branch = session["target_branch"]
+
+    if not wt.exists():
+        raise GitAgentError(f"Worktree missing: {wt}")
+
+    # Warn (not block) if agents are still active
+    active = db.fetchall(
+        "SELECT id FROM agents WHERE session_id = ? AND ended_at IS NULL",
+        (session["id"],),
+    )
+    # TODO: emit warning to stderr if active agents exist
+
+    # Phase 1: commit on the worktree
+    gitwrap.run(["add", "-A"], cwd=wt)
+    if gitwrap.is_clean(cwd=wt):
+        raise GitAgentError("Nothing to commit (worktree is clean).")
+
+    worktree_sha = gitwrap.commit(message, sign=sign, cwd=wt)
+
+    # Phase 2-5: land on target branch via detached temp worktree
+    temp_wt = repo / ".gitagent" / "_finalize_temp"
+    if temp_wt.exists():
+        gitwrap.worktree_remove(temp_wt, force=True, cwd=repo)
+        gitwrap.worktree_prune(cwd=repo)
+
+    try:
+        gitwrap.worktree_add_detached(temp_wt, target_branch, cwd=repo)
+
+        try:
+            gitwrap.run(["merge", "--squash", worktree_sha], cwd=temp_wt)
+        except GitAgentError as exc:
+            gitwrap.abort_merge(cwd=temp_wt)
+            raise GitAgentError(
+                f"Squash merge into '{target_branch}' conflicted. "
+                f"Resolve manually or abort.\n{exc}"
+            ) from exc
+
+        if gitwrap.is_clean(cwd=temp_wt):
+            raise GitAgentError(
+                "Nothing to commit after squash (no net changes vs target)."
+            )
+
+        final_sha = gitwrap.commit(message, sign=sign, cwd=temp_wt)
+
+        gitwrap.run(
+            ["update-ref", f"refs/heads/{target_branch}", final_sha],
+            cwd=repo,
         )
-    return out
+
+    finally:
+        # Always clean up both worktrees
+        if temp_wt.exists():
+            gitwrap.worktree_remove(temp_wt, force=True, cwd=repo)
+            gitwrap.worktree_prune(cwd=repo)
+
+    # Also remove the main worktree
+    if wt.exists():
+        gitwrap.worktree_remove(wt, force=True, cwd=repo)
+        gitwrap.worktree_prune(cwd=repo)
+
+    # If the user is on the target branch, refresh their checkout
+    cur_branch = gitwrap.current_branch(repo)
+    if cur_branch == target_branch:
+        gitwrap.reset_hard(final_sha, cwd=repo)
+
+    now = _now()
+    db.execute(
+        """UPDATE session
+           SET state = 'finalized', ended_at = ?, final_sha = ?
+           WHERE id = ?""",
+        (now, final_sha, session["id"]),
+    )
+    db.commit()
+
+    _append_log(session, message, final_sha)
+
+    return final_sha
 
 
-def log_entries(repo: Path | None = None) -> list[dict[str, Any]]:
-    repo = gitwrap.resolve(repo)
-    store.require_init(repo)
-    return store.read_log_at(store.global_log_path(repo))
-
-
-def abort(repo: Path | None = None, *, feature_name: str | None = None) -> None:
-    repo = gitwrap.resolve(repo)
-    store.require_init(repo)
-    p = _resolve_paths_for(repo, feature_name)
-    session = store.require_session(p)
-    store.log_event(p, {"event": "abort", "feature_key": p.feature.name, "session": session.id})
-    store.teardown(p, session, keep_log=True)
+def _append_log(session: dict, message: str, sha: str) -> None:
+    """Append a summary to .gitagent/log.jsonl (best-effort)."""
+    import json
+    try:
+        repo = gitwrap.repo_root()
+        log_path = repo / ".gitagent" / "log.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "event": "finalize",
+            "session_id": session["id"],
+            "feature": session["feature"],
+            "commit": sha,
+            "message": message,
+            "target_branch": session["target_branch"],
+            "ts": _now(),
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass

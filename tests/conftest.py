@@ -1,47 +1,87 @@
+"""Shared fixtures for gitagent v0.5.0 tests."""
 from __future__ import annotations
 
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
-
-def _git(args: list[str], cwd: Path) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
-    ).stdout
+from gitagent.db import Database, reset_db
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    r = tmp_path / "repo"
-    r.mkdir()
-    _git(["init", "-q", "-b", "main"], r)
-    _git(["config", "user.email", "t@t.t"], r)
-    _git(["config", "user.name", "tester"], r)
-    _git(["config", "commit.gpgsign", "false"], r)
-    (r / "README.md").write_text("# repo\n", encoding="utf-8")
-    _git(["add", "-A"], r)
-    _git(["commit", "-qm", "initial"], r)
-    return r
-
-
-@pytest.fixture
-def feature_branch(repo: Path) -> Path:
-    """A repo ready for gitagent, staying on `main` (branchless model)."""
+@pytest.fixture()
+def tmp_repo(tmp_path: Path):
+    """Create a temporary git repo with an initial commit."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=str(repo), check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=str(repo), check=True, capture_output=True,
+    )
+    # Initial commit so HEAD exists
+    (repo / "README.md").write_text("# test\n")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True,
+    )
     return repo
 
 
-@pytest.fixture
-def started(feature_branch: Path) -> Path:
-    from gitagent import session
+@pytest.fixture()
+def tmp_db(tmp_path: Path):
+    """Create a fresh in-memory-like temp DB (on disk for testability)."""
+    reset_db()
+    db_path = tmp_path / "test_state.db"
+    db = Database(db_path)
+    yield db
+    db.close()
+    reset_db()
 
-    session.init(feature_branch)
-    session.start(feature_branch, feature_name="test-feature")
-    return feature_branch
 
+@pytest.fixture()
+def repo_with_gitagent(tmp_repo: Path, tmp_db: Database):
+    """A temp repo + .gitagent dir + the tmp_db wired in.
 
-def write_and_commit(path: Path, content: str, msg: str, cwd: Path) -> None:
-    path.write_text(content, encoding="utf-8")
-    _git(["add", "-A"], cwd)
-    _git(["commit", "-qm", msg], cwd)
+    Patches get_db to return the test db, and sets up the repo structure
+    that session.py expects.
+    """
+    import gitagent.db as db_mod
+    import gitagent.session as session_mod
+    import gitagent.agents as agents_mod
+    import gitagent.edits as edits_mod
+    import gitagent.inbox as inbox_mod
+    import gitagent.intents as intents_mod
+
+    # Patch get_db to return our test db
+    db_mod.get_db = lambda path=None: tmp_db
+    session_mod.get_db = lambda path=None: tmp_db
+    agents_mod.get_db = lambda path=None: tmp_db
+    edits_mod.get_db = lambda path=None: tmp_db
+    inbox_mod.get_db = lambda path=None: tmp_db
+    intents_mod.get_db = lambda path=None: tmp_db
+
+    # Patch repo_root to return our tmp_repo
+    import gitagent.gitwrap as gw
+    _orig_repo_root = gw.repo_root
+    gw.repo_root = lambda cwd=None: tmp_repo
+
+    # Create .gitagent dir
+    (tmp_repo / ".gitagent").mkdir(exist_ok=True)
+
+    yield tmp_repo, tmp_db
+
+    # Restore
+    gw.repo_root = _orig_repo_root
+    db_mod.get_db = db_mod.get_db  # restore original
+    session_mod.get_db = session_mod.get_db
+    agents_mod.get_db = agents_mod.get_db
+    edits_mod.get_db = edits_mod.get_db
+    inbox_mod.get_db = inbox_mod.get_db
+    intents_mod.get_db = intents_mod.get_db
