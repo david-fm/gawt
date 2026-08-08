@@ -10,7 +10,7 @@ from . import agents, edits, inbox, intents, session
 from .db import get_db
 from .errors import GitAgentError
 
-server = MCPServer("gitagent", version="0.5.0")
+server = MCPServer("gitagent", version="0.5.1")
 
 
 def _err(e: Exception) -> str:

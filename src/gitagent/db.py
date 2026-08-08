@@ -2,10 +2,16 @@
 
 Provides a single-file database with PRAGMA user_version-based migrations.
 All gitagent state (sessions, agents, intents, edits, inbox) lives here.
+
+Thread-safe: each thread gets its own SQLite connection via threading.local().
+This allows MCP subagents running in separate threads to safely share the
+same Database instance without "SQLite objects created in a thread can only
+be used in that same thread" errors.
 """
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 CURRENT_VERSION = 1
@@ -79,27 +85,48 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 class Database:
-    """Thin wrapper around a sqlite3 connection with migration support."""
+    """Thin wrapper around a sqlite3 connection with migration support.
+
+    Each thread gets its own connection via threading.local() to avoid
+    SQLite threading errors when MCP subagents run in separate threads.
+    A lock protects initial connection creation to prevent WAL init races.
+    """
 
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._conn: sqlite3.Connection | None = None
+        self._local = threading.local()
+        self._init_lock = threading.Lock()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Return the connection for the current thread, creating if needed."""
+        if hasattr(self._local, "conn") and self._local.conn is not None:
+            return self._local.conn
+        with self._init_lock:
+            # Double-check after acquiring lock
+            if hasattr(self._local, "conn") and self._local.conn is not None:
+                return self._local.conn
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(self._path))
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            _migrate(conn)
+            self._local.conn = conn
+            return self._local.conn
 
     @property
     def conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self._path))
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            _migrate(self._conn)
-        return self._conn
+        return self._get_conn()
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Close the connection for the current thread."""
+        if hasattr(self._local, "conn") and self._local.conn is not None:
+            self._local.conn.close()
+            self._local.conn = None
+
+    def close_all(self) -> None:
+        """Close the current thread's connection. For full cleanup, call reset_db()."""
+        self.close()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)
