@@ -1,4 +1,4 @@
-"""MCP server entrypoint for gitagent v0.5.0.
+"""MCP server entrypoint for gitagent.
 
 Exposes all gitagent operations as MCP tools via stdio transport.
 """
@@ -13,8 +13,11 @@ from .errors import GitAgentError
 server = MCPServer("gitagent", version="0.5.1")
 
 
-def _err(e: Exception) -> str:
-    return f"error: {e}"
+def _err(e: Exception) -> dict[str, str]:
+    """Return machine-readable MCP tool error payload."""
+    message = str(e)
+    code = message.split(":", 1)[0] if ":" in message else type(e).__name__
+    return {"error": code, "message": message}
 
 
 # ---------------------------------------------------------------------------
@@ -22,41 +25,41 @@ def _err(e: Exception) -> str:
 # ---------------------------------------------------------------------------
 
 @server.tool()
-def start_session(feature: str, target_branch: str = "main") -> str:
+def start_session(feature: str, target_branch: str = "main") -> dict:
     """Start a new session with a single global worktree."""
     try:
         r = session.start_session(feature, target_branch)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def finalize_session(message: str, sign: bool = False) -> str:
+def finalize_session(message: str, sign: bool = False) -> dict:
     """Commit worktree state onto the target branch."""
     try:
         sha = session.finalize_session(message, sign=sign)
-        return str({"final_sha": sha})
+        return {"final_sha": sha}
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def abort_session() -> str:
+def abort_session() -> dict:
     """Remove worktree and mark session aborted."""
     try:
         session.abort_session()
-        return str({"ok": True})
+        return {"ok": True}
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def get_session() -> str:
+def get_session() -> dict | None:
     """Return the current open session or None."""
     try:
         r = session.get_session()
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
@@ -66,31 +69,31 @@ def get_session() -> str:
 # ---------------------------------------------------------------------------
 
 @server.tool()
-def register_agent(role: str = "") -> str:
+def register_agent(role: str = "") -> dict:
     """Register a new agent. Returns {agent_id}."""
     try:
         r = agents.register_agent(role)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def unregister_agent(agent_id: str) -> str:
+def unregister_agent(agent_id: str) -> dict:
     """Mark an agent as ended."""
     try:
         agents.unregister_agent(agent_id)
-        return str({"ok": True})
+        return {"ok": True}
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def list_agents() -> str:
+def list_agents() -> list[dict]:
     """List all agents in the current session."""
     try:
         r = agents.list_agents()
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
@@ -100,31 +103,31 @@ def list_agents() -> str:
 # ---------------------------------------------------------------------------
 
 @server.tool()
-def start_intent(agent_id: str, intent: str) -> str:
+def start_intent(agent_id: str, intent: str) -> dict:
     """Record the start of a new intent."""
     try:
         r = intents.start_intent(agent_id, intent)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def repurpose(agent_id: str, intent: str) -> str:
+def repurpose(agent_id: str, intent: str) -> dict:
     """Record an intent shift."""
     try:
         r = intents.repurpose(agent_id, intent)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def get_current_intent(agent_id: str) -> str:
+def get_current_intent(agent_id: str) -> dict | None:
     """Return the active intent for an agent."""
     try:
         r = intents.get_current_intent(agent_id)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
@@ -140,35 +143,40 @@ def edit_file(
     old_string: str,
     new_string: str,
     replace_all: bool = False,
-) -> str:
+    expected_sha256: str | None = None,
+) -> dict:
     """Exact-match string replacement with atomic write.
 
     Args:
         file: Relative to worktree root (same as repo root, e.g. "src/auth.py").
     """
     try:
-        r = edits.edit(agent_id, file, old_string, new_string, replace_all=replace_all)
-        return str(r)
+        r = edits.edit(
+            agent_id, file, old_string, new_string,
+            replace_all=replace_all,
+            expected_sha256=expected_sha256,
+        )
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def write_file(agent_id: str, file: str, content: str) -> str:
+def write_file(agent_id: str, file: str, content: str, expected_sha256: str | None = None) -> dict:
     """Create or overwrite a file with atomic write.
 
     Args:
         file: Relative to worktree root (same as repo root, e.g. "src/limiter.py").
     """
     try:
-        r = edits.write(agent_id, file, content)
-        return str(r)
+        r = edits.write(agent_id, file, content, expected_sha256=expected_sha256)
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def read_file(agent_id: str, file: str) -> str:
+def read_file(agent_id: str, file: str) -> dict:
     """Read a file. Returns content + sha256.
 
     Args:
@@ -176,21 +184,21 @@ def read_file(agent_id: str, file: str) -> str:
     """
     try:
         r = edits.read(agent_id, file)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def delete_file(agent_id: str, file: str) -> str:
+def delete_file(agent_id: str, file: str, expected_sha256: str | None = None) -> dict:
     """Remove a file.
 
     Args:
         file: Relative to worktree root (same as repo root, e.g. "src/old.py").
     """
     try:
-        r = edits.delete_file(agent_id, file)
-        return str(r)
+        r = edits.delete_file(agent_id, file, expected_sha256=expected_sha256)
+        return r
     except GitAgentError as e:
         return _err(e)
 
@@ -200,21 +208,21 @@ def delete_file(agent_id: str, file: str) -> str:
 # ---------------------------------------------------------------------------
 
 @server.tool()
-def check_inbox(agent_id: str) -> str:
+def check_inbox(agent_id: str) -> list[dict]:
     """Return unread inbox items for the agent, mark them read."""
     try:
         r = inbox.check_inbox(agent_id)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def send_message(from_agent_id: str, to_agent_id: str, message: str) -> str:
+def send_message(from_agent_id: str, to_agent_id: str, message: str) -> dict:
     """Send a message between agents."""
     try:
         r = inbox.send_message(from_agent_id, to_agent_id, message)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
@@ -224,17 +232,17 @@ def list_edits(
     agent_id: str | None = None,
     file: str | None = None,
     since_ts: str | None = None,
-) -> str:
+) -> list[dict]:
     """Debug: list edits with optional filters."""
     try:
         r = edits.list_edits(agent_id=agent_id, file=file, since_ts=since_ts)
-        return str(r)
+        return r
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def list_intents(agent_id: str | None = None) -> str:
+def list_intents(agent_id: str | None = None) -> list[dict]:
     """Debug: list intents."""
     try:
         db = get_db()
@@ -245,7 +253,7 @@ def list_intents(agent_id: str | None = None) -> str:
             )
         else:
             rows = db.fetchall("SELECT * FROM intents ORDER BY ts")
-        return str([dict(r) for r in rows])
+        return [dict(r) for r in rows]
     except GitAgentError as e:
         return _err(e)
 

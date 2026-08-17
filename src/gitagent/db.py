@@ -14,7 +14,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS session (
@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS inbox (
 
 CREATE INDEX IF NOT EXISTS idx_edits_file ON edits(session_id, file, ts);
 CREATE INDEX IF NOT EXISTS idx_inbox_to   ON inbox(to_agent, read, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_session
+    ON session(state) WHERE state = 'open';
 """
 
 
@@ -80,6 +82,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         return
     if version == 0:
         conn.executescript(_SCHEMA)
+        conn.execute(f"PRAGMA user_version = {CURRENT_VERSION}")
+        conn.commit()
+    elif version == 1:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_session "
+            "ON session(state) WHERE state = 'open'"
+        )
         conn.execute(f"PRAGMA user_version = {CURRENT_VERSION}")
         conn.commit()
 
@@ -110,6 +119,7 @@ class Database:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=5000")
             _migrate(conn)
             self._local.conn = conn
             return self._local.conn

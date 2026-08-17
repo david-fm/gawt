@@ -80,6 +80,28 @@ def test_path_escape_rejected(repo_with_gitagent):
         edits.write(aid, "../../etc/passwd", "pwned", db=db)
 
 
+def test_path_prefix_escape_rejected(repo_with_gitagent):
+    repo, db, aid = _setup_agent(repo_with_gitagent)
+    with pytest.raises(GitAgentError, match="escapes worktree"):
+        edits.write(aid, "../worktree-escape/file.txt", "pwned", db=db)
+
+
+def test_stale_edit_rejected(repo_with_gitagent):
+    repo, db, aid = _setup_agent(repo_with_gitagent)
+    edits.write(aid, "stale.txt", "before", db=db)
+    original = edits.read(aid, "stale.txt", db=db)
+    edits.write(aid, "stale.txt", "changed", db=db)
+    with pytest.raises(GitAgentError, match="STALE_WRITE"):
+        edits.edit(
+            aid,
+            "stale.txt",
+            "changed",
+            "new",
+            expected_sha256=original["sha256"],
+            db=db,
+        )
+
+
 def test_atomic_write_no_half_state(repo_with_gitagent):
     repo, db, aid = _setup_agent(repo_with_gitagent)
 

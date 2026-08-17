@@ -33,7 +33,7 @@ def _resolve(file: str, db: Database | None = None) -> Path:
     """Resolve a relative file path inside the worktree. Rejects escapes."""
     wt = _worktree(db)
     p = (wt / file).resolve()
-    if not str(p).startswith(str(wt.resolve())):
+    if not p.is_relative_to(wt.resolve()):
         raise GitAgentError(f"Path escapes worktree: {file}")
     return p
 
@@ -122,6 +122,7 @@ def edit(
     new_string: str,
     *,
     replace_all: bool = False,
+    expected_sha256: str | None = None,
     db: Database | None = None,
 ) -> dict:
     """Exact-match string replacement with atomic write.
@@ -137,6 +138,13 @@ def edit(
         raise GitAgentError(f"File not found: {file}")
 
     content = target.read_text(encoding="utf-8")
+    if expected_sha256 is not None:
+        actual_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise GitAgentError(
+                f"STALE_WRITE: '{file}' changed after it was read. "
+                "Read the file again before editing."
+            )
 
     # Count occurrences
     count = content.count(old_string)
@@ -182,6 +190,7 @@ def write(
     file: str,
     content: str,
     *,
+    expected_sha256: str | None = None,
     db: Database | None = None,
 ) -> dict:
     """Create or overwrite a file with atomic write.
@@ -191,6 +200,16 @@ def write(
     db = db or get_db()
     validate_agent(agent_id, db)
     target = _resolve(file, db)
+
+    if expected_sha256 is not None:
+        if not target.exists():
+            raise GitAgentError(f"STALE_WRITE: expected existing file '{file}'.")
+        actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise GitAgentError(
+                f"STALE_WRITE: '{file}' changed after it was read. "
+                "Read the file again before writing."
+            )
 
     _atomic_write(target, content.encode("utf-8"))
 
@@ -225,7 +244,8 @@ def read(agent_id: str, file: str, *, db: Database | None = None) -> dict:
 
 
 def delete_file(
-    agent_id: str, file: str, *, db: Database | None = None
+    agent_id: str, file: str, *, expected_sha256: str | None = None,
+    db: Database | None = None
 ) -> dict:
     """Remove a file. Returns ``{ok: True, path}``."""
     db = db or get_db()
@@ -233,6 +253,12 @@ def delete_file(
     target = _resolve(file, db)
 
     if target.exists():
+        if expected_sha256 is not None:
+            actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise GitAgentError(
+                    f"STALE_WRITE: '{file}' changed after it was read."
+                )
         target.unlink()
 
     _detect_conflicts(agent_id, file, db)

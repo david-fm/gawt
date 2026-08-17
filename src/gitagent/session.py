@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import secrets
 import shutil
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -44,35 +45,42 @@ def start_session(
     Returns ``{session_id, worktree, base_sha}``.
     """
     db = db or get_db()
+    if not feature or not feature.strip():
+        raise GitAgentError("Feature is required.")
+    if not target_branch or not re.fullmatch(r"[A-Za-z0-9._/-]+", target_branch):
+        raise GitAgentError(f"Invalid target branch: {target_branch!r}")
 
-    existing = get_session(db)
-    if existing is not None:
-        raise GitAgentError(
-            f"Session already open (id={existing['id']}, feature={existing['feature']}). "
-            "Finalize or abort it first."
+    # Serialize check/create across processes. The partial unique index is the
+    # final invariant; this transaction prevents competing worktree creation.
+    db.conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = get_session(db)
+        if existing is not None:
+            raise GitAgentError(
+                f"Session already open (id={existing['id']}, feature={existing['feature']}). "
+                "Finalize or abort it first."
+            )
+
+        repo = gitwrap.repo_root()
+        base_sha = gitwrap.current_sha(cwd=repo)
+        wt_path = repo / ".gitagent" / "worktree"
+        if wt_path.exists():
+            shutil.rmtree(wt_path, ignore_errors=True)
+        gitwrap.worktree_add_detached(wt_path, base_sha, cwd=repo)
+
+        sid = _sid()
+        now = _now()
+        db.execute(
+            """INSERT INTO session
+               (id, feature, target_branch, base_sha, worktree, state, created_at)
+               VALUES (?, ?, ?, ?, ?, 'open', ?)""",
+            (sid, feature.strip(), target_branch, base_sha, str(wt_path), now),
         )
-
-    repo = gitwrap.repo_root()
-    base_sha = gitwrap.current_sha(cwd=repo)
-
-    wt_path = repo / ".gitagent" / "worktree"
-    if wt_path.exists():
-        shutil.rmtree(wt_path, ignore_errors=True)
-
-    gitwrap.worktree_add_detached(wt_path, base_sha, cwd=repo)
-
-    sid = _sid()
-    now = _now()
-
-    db.execute(
-        """INSERT INTO session
-           (id, feature, target_branch, base_sha, worktree, state, created_at)
-           VALUES (?, ?, ?, ?, ?, 'open', ?)""",
-        (sid, feature, target_branch, base_sha, str(wt_path), now),
-    )
-    db.commit()
-
-    return {"session_id": sid, "worktree": str(wt_path), "base_sha": base_sha}
+        db.commit()
+        return {"session_id": sid, "worktree": str(wt_path), "base_sha": base_sha}
+    except Exception:
+        db.conn.rollback()
+        raise
 
 
 def abort_session(db: Database | None = None) -> None:
