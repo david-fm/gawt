@@ -1,7 +1,9 @@
-"""SQLite state store for gitagent v0.5.0.
+"""SQLite state store for gitagent v0.6.0.
 
 Provides a single-file database with PRAGMA user_version-based migrations.
-All gitagent state (sessions, agents, intents, edits, inbox) lives here.
+All gitagent state (sessions, agents, intents, edits, snapshot progress,
+locks, snapshots) lives here. The inbox is gone: coordination emerges from
+the edit log (pheromone), not from messages.
 
 Thread-safe: each thread gets its own SQLite connection via threading.local().
 This allows MCP subagents running in separate threads to safely share the
@@ -14,19 +16,20 @@ import sqlite3
 import threading
 from pathlib import Path
 
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS session (
-    id          TEXT PRIMARY KEY,
-    feature     TEXT NOT NULL,
-    target_branch TEXT NOT NULL,
-    base_sha    TEXT NOT NULL,
-    worktree    TEXT NOT NULL,
-    state       TEXT NOT NULL DEFAULT 'open',
-    created_at  TEXT NOT NULL,
-    ended_at    TEXT,
-    final_sha   TEXT
+    id              TEXT PRIMARY KEY,
+    feature         TEXT NOT NULL,
+    target_branch   TEXT NOT NULL,
+    base_sha        TEXT NOT NULL,
+    worktree        TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'open',
+    created_at      TEXT NOT NULL,
+    ended_at        TEXT,
+    final_sha       TEXT,
+    lock_ttl_seconds INTEGER NOT NULL DEFAULT 15
 );
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -55,24 +58,42 @@ CREATE TABLE IF NOT EXISTS edits (
     new_string   TEXT,
     full_content TEXT,
     intent_id    INTEGER,
+    replace_all  INTEGER NOT NULL DEFAULT 0,
     ts           TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS inbox (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    to_agent   TEXT NOT NULL,
-    from_agent TEXT,
-    kind       TEXT NOT NULL,
-    payload    TEXT,
-    ts         TEXT NOT NULL,
-    read       INTEGER NOT NULL DEFAULT 0
+CREATE INDEX IF NOT EXISTS idx_edits_file ON edits(session_id, file, ts);
+
+CREATE TABLE IF NOT EXISTS snapshot_progress (
+    session_id   TEXT NOT NULL,
+    file         TEXT NOT NULL,
+    last_edit_id INTEGER NOT NULL DEFAULT 0,
+    last_ts      TEXT,
+    PRIMARY KEY (session_id, file)
 );
 
-CREATE INDEX IF NOT EXISTS idx_edits_file ON edits(session_id, file, ts);
-CREATE INDEX IF NOT EXISTS idx_inbox_to   ON inbox(to_agent, read, ts);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_session
-    ON session(state) WHERE state = 'open';
+CREATE TABLE IF NOT EXISTS locks (
+    file         TEXT PRIMARY KEY,
+    holder_agent TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    token        TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL,
+    message          TEXT NOT NULL,
+    boundary_edit_id INTEGER,
+    files            TEXT NOT NULL,
+    sha              TEXT NOT NULL,
+    ts               TEXT NOT NULL
+);
 """
+
+_COLUMN_EXISTS = (
+    "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?"
+)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -80,17 +101,55 @@ def _migrate(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version >= CURRENT_VERSION:
         return
+
     if version == 0:
         conn.executescript(_SCHEMA)
         conn.execute(f"PRAGMA user_version = {CURRENT_VERSION}")
         conn.commit()
-    elif version == 1:
+        return
+
+    # version == 1 || version == 2: migrate up to v3 incrementally.
+    conn.execute("DROP INDEX IF EXISTS idx_one_open_session")
+    conn.execute("DROP INDEX IF EXISTS idx_inbox_to")
+    conn.execute("DROP TABLE IF EXISTS inbox")
+    if conn.execute(_COLUMN_EXISTS, ("session", "lock_ttl_seconds")).fetchone()[0] == 0:
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_session "
-            "ON session(state) WHERE state = 'open'"
+            "ALTER TABLE session ADD COLUMN lock_ttl_seconds "
+            "INTEGER NOT NULL DEFAULT 15"
         )
-        conn.execute(f"PRAGMA user_version = {CURRENT_VERSION}")
-        conn.commit()
+    if conn.execute(_COLUMN_EXISTS, ("edits", "replace_all")).fetchone()[0] == 0:
+        conn.execute(
+            "ALTER TABLE edits ADD COLUMN replace_all INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_progress (
+            session_id   TEXT NOT NULL,
+            file         TEXT NOT NULL,
+            last_edit_id INTEGER NOT NULL DEFAULT 0,
+            last_ts      TEXT,
+            PRIMARY KEY (session_id, file)
+        );
+        CREATE TABLE IF NOT EXISTS locks (
+            file         TEXT PRIMARY KEY,
+            holder_agent TEXT NOT NULL,
+            session_id   TEXT NOT NULL,
+            token        TEXT NOT NULL,
+            acquired_at  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id       TEXT NOT NULL,
+            message          TEXT NOT NULL,
+            boundary_edit_id INTEGER,
+            files            TEXT NOT NULL,
+            sha              TEXT NOT NULL,
+            ts               TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(f"PRAGMA user_version = {CURRENT_VERSION}")
+    conn.commit()
 
 
 class Database:
@@ -111,7 +170,6 @@ class Database:
         if hasattr(self._local, "conn") and self._local.conn is not None:
             return self._local.conn
         with self._init_lock:
-            # Double-check after acquiring lock
             if hasattr(self._local, "conn") and self._local.conn is not None:
                 return self._local.conn
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,6 +211,9 @@ class Database:
     def commit(self) -> None:
         self.conn.commit()
 
+    def rollback(self) -> None:
+        self.conn.rollback()
+
 
 _db: Database | None = None
 
@@ -167,6 +228,7 @@ def get_db(path: Path | None = None) -> Database:
     if _db is None:
         if path is None:
             from .gitwrap import repo_root
+
             path = repo_root() / ".gitagent" / "state.db"
         _db = Database(Path(path))
     return _db

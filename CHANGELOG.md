@@ -7,30 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed (BREAKING)
-- **MCP-only.** CLI removed. All operations exposed as MCP tools over stdio.
-- **Single global worktree.** Replaces per-agent worktrees. Features are serialized; parallelism lives in agents sharing one worktree.
-- **SQLite state store.** Replaces JSON files. Tracks sessions, agents, intents, edits, and inbox with full attribution.
-- **Live edit tracking.** Every `edit_file`/`write_file` records `(agent_id, file, intent, ts)` in SQLite.
-- **Semantic intents.** `start_intent`/`repurpose` annotate the edit log with purpose.
-- **Inbox coordination.** Best-effort conflict notifications between agents. No file locks.
-- **Atomic writes.** All writes go through temp + `os.replace` (POSIX-atomic).
-- **Agent id per call.** Agent passes its `agent_id` explicitly on every tool call. No cwd/env inference.
-- Removed: `cli.py`, `store.py`, `proposals.py`, `review.py`, `finalize.py` (replaced by `mcp_server.py`, `db.py`, `session.py`, `agents.py`, `intents.py`, `edits.py`, `inbox.py`).
-- Removed: `typer`, `rich` dependencies. Added: `mcp>=2.0`.
-- Removed: `propose`, `spawn`, `integrate`, `accept`, `reject`, `revise`, `init`, `status`, `list-features`, `log`, `kill`, `install-skill` CLI commands.
-- New entry point: `gitagent-mcp` (was `gitagent`).
-
-### Added
-- `db.py` — SQLite wrapper with `PRAGMA user_version` migrations.
-- `session.py` — `start_session`, `finalize_session`, `abort_session`, `get_session`.
-- `agents.py` — `register_agent` (auto `a_<hex>`), `unregister_agent`, `list_agents`, `validate_agent`.
-- `intents.py` — `start_intent`, `repurpose`, `get_current_intent`.
-- `edits.py` — `edit_file`, `write_file`, `read_file`, `delete_file` with atomic writes and conflict detection.
-- `inbox.py` — `check_inbox`, `send_message`.
-- `mcp_server.py` — FastMCP entrypoint (stdio transport).
-- 39 tests covering all new modules.
-- `PLAN.md` — full design document for v0.5.0.
+### Changed (BREAKING) — v0.6.0
+- **Inbox removed.** `check_inbox` / `send_message` / `inbox.py` are gone. Coordination now emerges from the **pheromone** (the `edits` log), not messages.
+- **Per-file write locks.** `write_file` / `edit_file` / `delete_file` acquire a lock first and always release it in `finally`. A fresh foreign lock → **informed rejection** (`{status: "rejected", read: {...}}`), never applied. No waiting in the server.
+- **Reads are informed (git-style).** Same `read_file` tool now returns `content`, `sha256`, `path`, `base_sha`, `diff`, `edits[]`, and an intent `warning`. No diff toggle — the git diff is always present.
+- **Partial snapshots multi-orchestrator.** `finalize_session` removed. New `snapshot_session` commits part of the shared worktree onto the target branch via a temp worktree, without deleting the live worktree. Per-file `snapshot_progress` maintains the frontier per session.
+- **Multi-session.** Several sessions share ONE worktree. `start_session` reuses it; `abort_session(session_id)` removes it only when no other session is open.
+- **Target branch fixed per worktree.** The first session picks it; later ones ignore a new `target_branch`.
+- **Crash reconciliation.** Disk is the source of truth: `snapshot_status` inserts synthetic `{op: "adjusted"}` rows for disk changes with no pheromone entry, so replay never raises `REPLAY_MISMATCH` on crash residue.
+- **Schema migration `user_version` 2 → 3.** Dropped `inbox` and `idx_one_open_session`; added `replace_all` to `edits`, `lock_ttl_seconds` to `session`, and new `snapshot_progress` / `locks` / `snapshots` tables.
+- New tools: `snapshot_session`, `snapshot_status`, `list_snapshots`, `list_sessions`.
+- Removed tool: `finalize_session`.
+- `list_edits` gains `limit` (row cap for boundary picking).
+- Removed: `inbox.py`, `tests/test_inbox.py`. Added: `locks.py`, `replay.py`, `snapshot.py`, `tests/test_locks.py`, `test_replay.py`, `test_snapshot.py`, `test_status.py`, `test_reconcile.py`.
 
 ## [0.4.2] - 2026-07-29
 

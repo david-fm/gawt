@@ -1,8 +1,8 @@
 # gitagent
 
-> MCP-first agent workspace manager: single worktree, live edit tracking, semantic intents, inbox coordination.
+> MCP-first agent workspace manager: shared worktree, pheromone edit tracking, semantic intents, per-file locks, partial snapshots.
 
-`gitagent` v0.5.0 is a total rewrite. The CLI is gone — all operations are exposed as **MCP tools** over stdio. A single global worktree hosts multiple agents simultaneously. Every edit is tracked in SQLite with full attribution. Agents coordinate via an inbox with best-effort conflict notifications.
+`gitagent` v0.6.0 is a total rewrite. The CLI is gone — all operations are exposed as **MCP tools** over stdio. Multiple sessions share ONE global worktree. Every edit is tracked in SQLite with full attribution (the **pheromone**). Coordination — no inbox — emerges from the edit log. Writes acquire per-file locks and **reject informed** on conflict; orchestrators publish their part via **partial snapshots**.
 
 ## Install
 
@@ -20,23 +20,29 @@ Requires Python 3.11+ and a working `git` on `PATH`.
 ## Quick start
 
 ```python
-# Start a session
-start_session(feature="auth-rate-limiting")
+# Orchestrator: start a session (creates/reuses the shared worktree)
+sess_a = start_session(feature="auth-rate-limiting")
+sess_b = start_session(feature="tests-for-limiter")   # same worktree, 2nd session
 
-# Register agents
-register_agent(role="implement limiter")   # → {"agent_id": "a_3f2c"}
-register_agent(role="write tests")         # → {"agent_id": "a_7b1e"}
+# Register + route agents (session_id required with 2+ open sessions)
+register_agent(role="implement limiter", session_id=sess_a["session_id"])
+register_agent(role="write tests", session_id=sess_b["session_id"])
 
-# Agents set intent and edit files
+# Agents set intent and edit files (pheromone + lock)
 start_intent(agent_id="a_3f2c", intent="implement rate limiter")
 edit_file(agent_id="a_3f2c", file="src/auth.py", old_string="...", new_string="...")
 
-# Check for conflicts
-check_inbox(agent_id="a_3f2c")
+# Orchestrator: inspect shared state, pick a frontier
+snapshot_status(session_id=sess_a["session_id"])      # whole worktree vs target
+list_edits(limit=50)
 
-# Finalize (orchestrator only)
-finalize_session(message="feat(auth): rate limiting")
-# → 1 commit on main, worktree removed
+# Orchestrator: publish only its part (live worktree stays)
+snapshot_session(session_id=sess_a["session_id"], message="feat(auth): rate limiter",
+                 files=["src/auth.py"])
+# → 1 commit on target branch; other sessions keep the worktree
+
+# Orchestrator ends the session
+abort_session(session_id=sess_a["session_id"])        # removes worktree only if last open
 ```
 
 ## Architecture
@@ -45,41 +51,44 @@ finalize_session(message="feat(auth): rate limiting")
 Host (Claude Code / opencode)
   → spawns: gitagent mcp (stdio)
     → .gitagent/state.db (sqlite)
-    → .gitagent/worktree/ (single detached worktree)
+    → .gitagent/worktree/ (ONE shared detached worktree)
 ```
 
-- One worktree active at a time. Features are serialized.
-- Multiple agents share the worktree and coordinate via SQLite inbox.
+- Multiple sessions open at once, each with its own agents.
+- One worktree per repo, reused across sessions. Snapshots never delete it.
+- Target branch fixed per worktree (the first session picks it).
 - User's checkout on `main` is never touched.
 
 ## MCP Tools
 
 | Category | Tools |
 |---|---|
-| Lifecycle | `start_session`, `finalize_session`, `abort_session`, `get_session` |
+| Sessions | `start_session`, `abort_session`, `get_session`, `list_sessions` |
+| Snapshots | `snapshot_session`, `snapshot_status`, `list_snapshots` |
 | Agents | `register_agent`, `unregister_agent`, `list_agents` |
 | Intent | `start_intent`, `repurpose`, `get_current_intent` |
 | Editing | `edit_file`, `write_file`, `read_file`, `delete_file` |
-| Inbox | `check_inbox`, `send_message`, `list_edits`, `list_intents` |
+| Observability | `list_edits`, `list_intents` |
 
-All tools except lifecycle require `agent_id` explicitly per call.
+All editing/intent tools require `agent_id` per call.
 
 ## How it works
 
-- **Single worktree**: detached worktree at `.gitagent/worktree/`. All agents edit the same files.
-- **Live tracking**: every `edit_file`/`write_file` records `(agent_id, file, intent, ts)` in SQLite.
-- **Atomic writes**: all writes go through temp + `os.replace` (POSIX-atomic). Files are never half-written.
-- **Best-effort conflicts**: if two agents edit the same file within 30s, both get an inbox notification. No locks, no blocking.
-- **Semantic intents**: `start_intent`/`repurpose` annotate the edit log with *why* changes are made.
-- **Finalize**: `finalize_session` commits the worktree state onto the target branch via detached temp worktree + `git update-ref`. Single commit, no push.
+- **Shared worktree**: one detached worktree at `.gitagent/worktree/`, shared by all sessions and their agents.
+- **Pheromone**: every `edit_file` / `write_file` / `delete_file` records `(agent_id, session_id, file, intent_id, op, ts)` in SQLite — a traceable "I edited this, with this intent".
+- **Per-file locks**: writes acquire a lock first and always release it in `finally` (TTL default 15s reclaims orphans). A fresh foreign lock → informed `rejected` response with the current `read`.
+- **Informed reads**: `read_file` returns content + sha256 + `base_sha` + `diff` + `edits[]` + intent `warning`.
+- **Atomic writes**: all writes go through temp + `os.replace` (POSIX-atomic); disk is the source of truth.
+- **Partial snapshots**: `snapshot_session` commits *part* of the worktree onto the target branch via a detached temp worktree, without touching the live worktree. Per-file `snapshot_progress` tracks each session's frontier.
+- **Crash reconciliation**: `snapshot_status` inserts synthetic `adjusted` rows for disk changes with no pheromone entry, so `replay` never fails on crash residue.
 
 ## Layout
 
 ```
 <repo>/.gitagent/
-├── state.db              # sqlite: sessions, agents, intents, edits, inbox
-├── worktree/             # single detached worktree (active session)
-├── _finalize_temp/       # temp worktree during finalize (auto-cleaned)
+├── state.db              # sqlite: sessions, agents, intents, edits, snapshot_progress, locks, snapshots
+├── worktree/             # ONE shared detached worktree (all open sessions)
+├── _snapshot_temp/       # temp worktree during a snapshot commit (auto-cleaned)
 └── log.jsonl             # append-only audit trail
 ```
 

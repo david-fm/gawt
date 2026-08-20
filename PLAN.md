@@ -1,372 +1,347 @@
-# Plan: gitagent v0.5.0 — MCP-first, single global worktree
+# Plan: gitagent v0.6.0 — Protocolo feromona (sin inbox, rechazo en escrituras, snapshots parciales multi-orquestador)
 
-> **Status:** draft for review.
-> **Branch (when work starts):** `feat/mcp-sqlite-core` from `main`.
-> **Release:** merge to `main` + tag `v0.5.0` after user validation.
-
----
-
-## 1. Goals
-
-- Replace the CLI/proposal/patch pipeline with an **MCP server** as the only public surface.
-- Track **every edit live** in SQLite with full attribution `(agent_id, file, intent, ts)`.
-- Provide **semantic intent tools** (`start_intent`, `repurpose`) so the edit log carries meaning.
-- Provide an **inbox + conflict notification system** so multiple agents in the same worktree can coordinate.
-- Use a **single global worktree** at a time. Parallelism lives in the agents, not in worktrees.
-- Drop `propose`, `spawn` (as worktree creator), and `integrate`. `finalize_session` commits the worktree state directly.
-
-## 2. Non-goals (v0.5.0)
-
-- Multi-worktree / multi-feature parallel sessions (features are serialized).
-- File locks (best-effort + inbox notifications only).
-- Detection of writes made through host-side `Edit`/`Write` tools (prompt enforcement only).
-- HTTP / SSE MCP transport (stdio only for v0.5.0).
-- Backward compatibility with v0.4.2.
+> **Estado:** borrador para iterar — definido para nueva sesión con solo este documento.
+> **Rama de trabajo:** `feat/v0.6-pheromone-snapshot` desde `main`.
+> **Release:** merge a `main` + tag `v0.6.0` tras validación del usuario.
 
 ---
 
-## 3. Architecture
+## 1. Objetivos
 
-```
-┌─ Host (Claude Code / opencode / ...) ─┐
-│  spawns: gitagent mcp (stdio)         │
-└──────────────────┬────────────────────┘
-                   │ MCP stdio
-┌──────────────────▼────────────────────┐
-│ gitagent mcp server (FastMCP)         │
-└──────────────────┬────────────────────┘
-                   │
-        ┌──────────┴──────────┐
-        ▼                     ▼
-  .gitagent/state.db    .gitagent/worktree/   ← single, global
-  (sqlite)              (detached worktree)
-```
+- **Eliminar el inbox.** No hay comunicación directa entre agentes. La coordinación emerge de la **feromona**: un log en la BD con tripletas `(actual_intent_id, op, archivo)`. Cada edición deja una marca rastreable: "yo edité este archivo, y cuando lo edité tenía esta intención".
+- **Escrituras con lock por archivo y rechazo informado.** `write_file` / `edit_file` / `delete_file` **adquieren el lock del archivo al inicio** y lo **liberan al final, siempre** (`try/finally`). Si otro agente activo lo mantiene → la escritura **NO se aplica** y se devuelve el output de `read_file` (informado), para que el agente re-planifique sabiendo qué pasó. No hay espera de bloqueo en el server.
+- **Lecturas informadas (estilo git).** `read_file` devuelve contenido + diff contra la base (rama target) + histórico de ediciones con intención. Es la misma herramienta de lectura, no una nueva.
+- **`snapshot_status`** — nueva herramienta que devuelve el estado del snapshot como un `read` de **todo el worktree** (todos los archivos editados), estilo diff.
+- **Warning de intent en cada lectura.** `read_file` y `snapshot_status` devuelven un aviso corto en cada respuesta recordando que la intent debe estar actualizada antes de escribir.
+- **Snapshots parciales multi-orquestador.** Varias sesiones abiertas a la vez, cada una con sus especialistas. El orquestador hace **snapshot** de la parte que considere suya: commit en la rama del worktree, con archivos y `boundary_edit_id` opcionales, sin borrar el worktree.
+- **Iteración por snapshot.** El snapshot avanza la frontera (por archivo/sesión); lo posterior y los archivos no incluidos quedan para la siguiente.
+- **Documento autónomo.** Este `PLAN.md` es la única referencia; una sesión nueva debería poder implementar v0.6.0 literal.
 
-- One detached worktree under `.gitagent/worktree/` is active at any moment.
-- Multiple agents share that worktree and coordinate through the SQLite inbox.
-- The user's checkout on `main` is never touched. `finalize_session` produces a single commit on the target branch via a detached temp worktree + `git update-ref`, exactly as v0.4.2 did.
+## 2. No-objetivos (v0.6.0)
 
----
-
-## 4. Lifecycle (global state machine)
-
-```
-state: no_worktree
-  ↓ start_session(feature="x", target_branch="main")
-state: open (one worktree active)
-  ├─ register_agent(role)               # called multiple times
-  ├─ agents use edit / write / read / check_inbox / start_intent / repurpose
-  ├─ start_session(feature="y") → error if previous session is not finalized/aborted
-  ↓ finalize_session(message)
-state: finalized (commit on target_branch, worktree removed)
-  ↓ start_session(feature="z")
-state: open
-  ...
-```
-
-Only one session is `open` at a time. Features are serialized. Parallelism is achieved by spawning many agents in the same session.
+- Sin colas de escritores ni fairness: el lock es optimista.
+- Sin espera dentro del server MCP (evita timeouts del cliente). El conflicto se resuelve en el agente vía rechazo informado.
+- Sin merge automático de conflictos.
+- Sin detección de escrituras fuera de MCP (solo prompt enforcement).
+- HTTP/SSE MCP transport: no (solo stdio).
+- Retrocompatibilidad con v0.5.x (breaking total).
 
 ---
 
-## 5. SQLite schema
+## 3. Arquitectura
+
+```
+Host (Claude Code / opcode / ...)
+  → spawns: gitagent mcp (stdio)
+    → .gitagent/state.db (sqlite)
+    → .gitagent/worktree/   ← worktree compartido por TODAS las sesiones
+```
+
+- **Varias sesiones open a la vez**, cada una con sus agentes.
+- **Un worktree por repositorio**, reutilizado entre sesiones (no se borra al hacer snapshot).
+- **Target de rama a nivel de worktree.** La primera sesión sobre un worktree define `target_branch`; las siguientes lo comparten. Todas las snapshots de un worktree van a la misma rama. `start_session` no acepta cambiar target en sesiones posteriores (solo si se crea el worktree).
+
+---
+
+## 4. Lifecycle (multi-sesión, worktree compartido)
+
+```
+no_worktree
+  ↓ start_session(feature, target_branch?)        # crea worktree + sesión; pick target
+worktree + 1..n sesiones open
+  ├─ register_agent(role, session_id?)            # 1 open: opcional; 2+: OBLIGATORIO (error duro)
+  ├─ agente: start_intent → read / edit / write / delete (lock + rechazo informado)
+  ├─ snapshot_session(session_id, message, files?, boundary_edit_id?)   # commit parcial, worktree SIGUE vivo
+  ├─ snapshot_status(session_id)                  # estado del snapshot actual (worktree completo vs target)
+  ├─ abort_session(session_id)                    # marca aborted; SOLO borra trabajo si es la última open
+  ├─ get_session(session_id?), list_sessions()
+  ▼
+finalizado/aborted por sesión
+```
+
+Permitido: sesión A procesando `src/auth.py`, sesión B `tests/`. Especialistas compiten por un archivo compartido; uno gana el lock, el otro recibe rechazo y cambia de plan.
+
+---
+
+## 5. Esquema SQLite (migración `user_version` 2 → 3)
+
+Se conservan `session`, `agents`, `intents`, `edits`. Se elimina `inbox`.
 
 ```sql
-PRAGMA user_version = 1;
+PRAGMA user_version = 3;
 
-CREATE TABLE session (
-  id TEXT PRIMARY KEY,           -- 's_<hex>' (effectively a singleton)
-  feature TEXT NOT NULL,         -- logical label, e.g. 'auth-rl'
-  target_branch TEXT NOT NULL,   -- default 'main'
-  base_sha TEXT NOT NULL,
-  worktree TEXT NOT NULL,
-  state TEXT,                    -- 'open' | 'finalized' | 'aborted'
-  created_at TEXT,
-  ended_at TEXT,
-  final_sha TEXT                 -- commit SHA on target_branch post-finalize
+-- 1. Multi-open: eliminar la única-sesión como invariante
+DROP INDEX idx_one_open_session;
+
+-- 2. Eliminar inbox
+DROP TABLE inbox;
+
+-- 3. Blank para re-play exacto
+ALTER TABLE edits ADD COLUMN replace_all INTEGER NOT NULL DEFAULT 0;
+
+-- 4. Frontera por archivo y por sesión (la "iteración de snapshot")
+CREATE TABLE IF NOT EXISTS snapshot_progress (
+    session_id   TEXT NOT NULL,
+    file         TEXT NOT NULL,
+    last_edit_id INTEGER NOT NULL DEFAULT 0,
+    last_ts      TEXT,
+    PRIMARY KEY (session_id, file)
 );
 
-CREATE TABLE agents (
-  id TEXT PRIMARY KEY,           -- 'a_<hex>'
-  session_id TEXT NOT NULL,
-  role TEXT,
-  started_at TEXT,
-  ended_at TEXT
+-- 5. Locks por archivo (escrituras)
+CREATE TABLE IF NOT EXISTS locks (
+    file         TEXT PRIMARY KEY,
+    holder_agent TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    token        TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL
 );
 
-CREATE TABLE intents (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  agent_id TEXT NOT NULL,
-  kind TEXT,                     -- 'start' | 'repurpose'
-  intent TEXT,
-  ts TEXT
+-- 6. Histórico de snapshots
+CREATE TABLE IF NOT EXISTS snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL,
+    message         TEXT NOT NULL,
+    boundary_edit_id INTEGER,          -- sin boundary_ts
+    files           TEXT NOT NULL,     -- JSON array de archivos incluidos
+    sha             TEXT NOT NULL,     -- commit hash en target
+    ts              TEXT NOT NULL
 );
-
-CREATE TABLE edits (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  agent_id TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  file TEXT NOT NULL,            -- relative to worktree root
-  op TEXT,                       -- 'edit' | 'write' | 'delete'
-  old_string TEXT,               -- op = 'edit'
-  new_string TEXT,               -- op = 'edit'
-  full_content TEXT,             -- op = 'write'
-  intent_id INTEGER,
-  ts TEXT
-);
-
-CREATE TABLE inbox (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  to_agent TEXT NOT NULL,
-  from_agent TEXT,
-  kind TEXT,                     -- 'conflict' | 'manual' | 'system'
-  payload TEXT,                  -- JSON
-  ts TEXT,
-  read INTEGER DEFAULT 0
-);
-
-CREATE INDEX idx_edits_file ON edits(session_id, file, ts);
-CREATE INDEX idx_inbox_to   ON inbox(to_agent, read, ts);
 ```
 
-The singleton invariant is enforced in code: queries against `session WHERE state = 'open'` are expected to return 0 or 1 row. `start_session` fails loudly if a row already exists in state `open`.
+### 5.1 Target a nivel de worktree
+
+- La fila `session` conserva `target_branch` por simplicidad, PERO el valor real se fija en la primera sesión que crea el worktree.
+- `start_session` cuando `worktree` ya existe: **ignora** `target_branch` nuevo y usa el del worktree.
+- No hay tabla de worktree separada inicial; si se quiere auditar mejor, añadiremos `worktrees` en v0.6.1. (decisión de simplicidad)
 
 ---
 
-## 6. MCP tools catalog
+## 6. Locks (`locks.py`) — escritura con rechazo informado
 
-All tools except lifecycle require `agent_id` explicitly per call.
+### 6.1 Adquisición (al inicio del write/edit/delete)
 
-### Lifecycle (orchestrator)
+```
+1. INSERT INTO locks(file, holder_agent, session_id, token, acquired_at)
+2. si el archivo ya tiene lock de OTRO agente activo → RECHAZADO (no aplica, nada espera)
+3. si el lock es de otro agente pero acquired_at expiró (> lock_ttl_seconds) → se reclama (huérfano por crash)
+4. si es el mismo agente → idempotente (reutiliza token)
+```
 
-| Tool | Effect |
+TTL por defecto: **15 segundos** (`lock_ttl_seconds=15`). Escrituras son rápidas (sub-ms temp + os.replace); 15s cubren con margen y permiten liberara huérfanos. `lock_ttl_seconds` configurable en `start_session`.
+
+### 6.2 Aplicación + liberación (SIEMPRE)
+
+Con lock adquirido → `try:` aplicar atomic write y grabar `edits` → `finally:` **liberar el lock SIEMPRE** (DELETE condicional por token, nunca libera lock de otro agente).
+
+### 1. Respuesta de escritura rechazada — NO se aplica
+
+```
+{
+  "status": "rejected",
+  "blocked_by": {"agent_id": "a_3f2c", "role": "...", "session_id": "s_x"},
+  "reason": "file locked by another agent",
+  "read": {
+     "content": "...",
+     "sha256": "...",
+     "path": "src/auth.py",
+     "base_sha": "<sha de rama target>",
+     "diff": "...",
+     "edits": [
+        {"edit_id": 12, "agent_id": "a_3f2c", "role": "impl", "intent": "rate limiter", "op": "edit", "ts": "..."},
+        ...
+     ]
+  }
+}
+```
+
+El campo `read` **es exactamente lo que devolvería `read_file(agent_id, file)`**. La escritura no se intenta. La respuesta normal (aplicó) sigue siendo `{ok: True, path}`.
+
+### 6.4 STALE_WRITE
+
+`expected_sha256` se comprueba tras adquirir el lock: si el archivo cambió entre la lectura y el write → `STALE_WRITE`, rechazo informado, sin aplicar.
+
+### 6.5 Locks de lectura
+
+`read_file` **nunca adquiere lock** (lecturas concurrentes). El write es atómico → nunca hay estado a medias.
+
+---
+
+## 7. `read_file` ampliada (es la MISMA herramienta)
+
+```
+{
+  "content": "...",
+  "sha256": "...",
+  "path": "src/auth.py",
+  "base_sha": "<sha de rama target>",
+  "diff": "<git diff textual del archivo vs target>",
+  "edits": [
+      {"edit_id": 12, "agent_id": "a_3f2c", "role": "...", "intent": "...", "op": "edit", "ts": "..."},
+      ...
+  ],
+  "warning": "La intención debe estar actualizada antes de escribir nada (start_intent/repurpose)."
+}
+```
+
+- `diff`: git diff real del archivo contra `target_branch` HEAD. **Sin toggle**: diff puro siempre. Confiamos en que los snapshots del worktree a la rama mantienen diffs pequeños (los snapshots logran cada vez más parecido al estado del target).
+- `edits`: histórico ordenado de ediciones del archivo con intención + rol. Correlación hunks ↔ edits.
+- `warning`: **SIEMPRE presente**, recuerdo corto.
+- `list_edits` gana `limit=N` para que el orquestador elija frontera.
+
+---
+
+## 8. `snapshot_status(session_id)` — estado del snapshot ACTUAL
+
+Nueva herramienta MCP. Devuelve **el diff de todos los archivos editados no commiteados en el worktree**, estilo `git status` + `git diff`, con la feromona:
+
+```
+{
+  "worktree": "/path/to/.gitagent/worktree",
+  "target_branch": "main",
+  "base_sha": "...",
+  "files": [
+    {
+      "file": "src/auth.py",
+      "status": "modified",          // 'added' | 'modified' | 'deleted' | 'clean'
+      "diff": "<git diff del archivo vs target>",
+      "edits": [ {edit_id, agent_id, role, intent, op, ts}, ... ],
+      "snapshot_progress": {"last_edit_id": 40, "last_ts": "..."}
+    }, ...
+  ],
+  "pending_files_count": 4,
+  "warning": "La intención debe estar actualizada antes de escribir (start_intent/repurpose)."
+}
+```
+
+- Ámbito: **todo el worktree** vs target (no filtra por sesión; el target es único del worktree). Así una sola llamada le da al orquestador la vista de trabajo en pendiente.
+- Se incluye `snapshot_progress` por archivo para que vea qué es nuevo vs lo ya commitado.
+- Última línea: alarm de intención igual que `read_file`.
+- El orquestador usa esto para decidir `files` y `boundary_edit_id` de la siguiente snapshot.
+
+---
+
+## 9. Snapshot (`snapshot.py`) — commit parcial multi-orquestador, sin borrar el worktree
+
+```python
+snapshot_session(
+    session_id: str,
+    message: str,
+    *,
+    boundary_edit_id: int | None = None,   # SIN boundary_ts (eliminado)
+    files: list[str] | None = None,        # explícito; None = TODOS los archivos (por trabajo completo)
+    sign: bool = False,
+)
+```
+
+Reglas:
+
+1. **Scope**: `files` `None` → **todos los archivos con ediciones** del worktree (cualquier agente/sesión). Lista → solo esos. **Solo los archivos incluidos** se tocan en target; el resto del árbol queda igual.
+2. **Frontera**: senza → contenido **actual del disco** (fast path). Con `boundary_edit_id` → se reconstruye cada archivo del scope **hasta ese `edit_id`** vía replay. La frontera la elige el orquestador tras `list_edits` / `read` / `snapshot_status`. El snapshot incluye ediciones **de cualquier agente/sesión** que quedaron ≤ frontera (estado real); ediciones posteriores NO entran.
+3. **Reconstrucción en frontera (`replay`)**: base = `git show <target>:<file>`; aplicar en orden `ts`/`id` todas las filas `edits` del archivo con `id ≤ boundary`: `write` (full content), `edit` (old→new con `replace_all`), `delete` (archivo ausente). Mismatch (excepto cambios fuera de MCP) → error claro `REPLAY_MISMATCH`, aborto, no se avanza frontera.
+4. **Commit**:
+   - temp worktree `.gitagent/_snapshot_temp/` sobre `target_branch`.
+   - Sobrescribir **solo** archivos del scope → `git add <scope>` (no `add -A`) → commit → `git update-ref`.
+   - Si ningún archivo cambió neto en target → **error limpio "nothing to snapshot"**, idempotente, sin fila `snapshots`.
+   - El worktree vivo NO se borra.
+5. **Frontera por archivo (CRÍTICO — punto 4)**:
+   - Tras commit: `snapshot_progress[session_id][archivo].last_edit_id = <último edit_id del archivo ≤ boundary_edit_id>`, o el `edit_id` máximo del archivo si no hubo frontera.
+   - Archivos **fuera de `files` NO avanzan**, aunque sus ediciones sean **anteriores** al `edit_id` elegido — quedan pendientes para el siguiente snapshot de esa sesión. (lo que S2 tocó no se pierde; la next iter lo coge).
+   - Ejemplo:
+
+     ```
+      S1: a1 edita a.py (id=1) y b.py (id=2)
+      S2: a2 edita b.py (id=3) y a.py (id=4)
+      S1: snapshot_session(files=["a.py"], boundary_edit_id=4)
+      ASSERT:
+        - commit pone a.py = replay(base + edit1 + edit4)  (estado real en frontera 4)
+        - b.py NO se toca en target; snapshot_progress[S1]["b.py"] NO avanza (sigue 0)
+        - snapshot_progress[S1]["a.py"] = 4
+        - siguiente snapshot (S1, files=["b.py"],... ) reconstruye b.py incluyendo edit2 y edit3 (estado actual), y avanza su progress
+     ```
+
+6. **Iteraciones**: snapshot 2 de S1 con files=["a.py"] → nada nuevo (a.py ya está en target) → `nothing to snapshot` (idempotente); b.py sigue pendiente.
+
+---
+
+## 10. Recuperación crash medio-write (DUDA 5 — elegida)
+
+`edits` = atribución de feromona, no fuente de verdad de contenido (el disco lo es). El orden operacional: aplicar `os.replace` (write) y luego `INSERT` fila en la BD. Ventana de crash microsegundos.
+
+**Solución elegante: reconciliación observada.** En `snapshot_status` (o al inicio del snapshot):
+- Comparar `git worktree diff` (por archivo) contra el log `edits`.
+- Si hay cambios en disco que ninguna fila explica (filas perdidas por crash) → insertar **fila sintética** `{op: 'adjusted', agent_id: '<unknown>', intent_id: NULL, ts: now}` para no dejar agujero en la feromona y que el replay en frontera **no** falle con `REPLAY_MISMATCH`.
+- El archivo se desconecta: la siguiente snapshot B podrá tomarlo en el estado actual (o con frontera validada).
+
+Nada de columnas `applied`, ni transacción file+SQLite, ni write-ahead: se mantiene simple, el disco manda, el crash queda observables al siguiente snapshot.
+
+---
+
+## 11. Cambios de código y archivos
+
+| Archivo | Cambio |
 |---|---|
-| `start_session(feature, target_branch="main")` | Fails if a session is already `open`. Creates a detached worktree from `target_branch` HEAD. Inserts a `session` row. Returns `{session_id, worktree, base_sha}`. |
-| `finalize_session(message, sign=False)` | Requires an `open` session. `git add -A` + commit on the worktree. Creates a detached temp worktree on `target_branch`, squashes the worktree commit, creates the final commit, `git update-ref` to advance the target. Removes the worktree, prunes. Marks session `finalized`. Returns `{final_sha}`. |
-| `abort_session()` | Removes the worktree, marks session `aborted`. |
-| `get_session()` | Returns the current `open` session or `null`. |
-
-### Agent lifecycle
-
-| Tool | Effect |
-|---|---|
-| `register_agent(role)` | Auto-assigns `a_<hex>`. Inserts `agents` row. Returns `{agent_id}`. |
-| `unregister_agent(agent_id)` | Sets `ended_at`. |
-| `list_agents()` | Lists agents of the current open session. |
-
-### Semantic intent
-
-| Tool | Effect |
-|---|---|
-| `start_intent(agent_id, intent)` | Inserts `intents` row `kind=start`. Returns `{intent_id}`. |
-| `repurpose(agent_id, intent)` | Inserts `intents` row `kind=repurpose`. Updates the current-intent pointer for that agent. |
-| `get_current_intent(agent_id)` | Returns the active `{intent_id, intent}`. |
-
-### File editing (replicates Claude Code Edit + Write)
-
-| Tool | Effect |
-|---|---|
-| `edit(agent_id, file, old_string, new_string, replace_all=False)` | Exact match + replace. Atomic write via temp + rename. Records an `edits` row. Runs conflict detection. |
-| `write(agent_id, file, content)` | Create / overwrite. Atomic write via temp + rename. Records an `edits` row. Runs conflict detection. |
-| `read(agent_id, file)` | Read file (no tracking). Returns content + sha256. |
-| `delete_file(agent_id, file)` | Removes file. Records `edits` row with `op='delete'`. |
-
-### Inbox + observability
-
-| Tool | Effect |
-|---|---|
-| `check_inbox(agent_id)` | Returns unread rows for the agent, marks them read. |
-| `send_message(from_agent_id, to_agent_id, message)` | Inserts an `inbox` row `kind='manual'`. |
-| `list_edits(agent_id=None, file=None, since_ts=None)` | Debug view. |
-| `list_intents(agent_id=None)` | Debug view. |
-
-### Validation rules applied on every tool call
-
-- `agent_id` is registered in the current open session.
-- `agent_id.ended_at IS NULL`.
-- `session.state == 'open'`.
-- File paths are inside the worktree (no `..` escape).
-- Failures return a clear error string the agent can act on.
+| `db.py` | migración v3 (`snapshot_progress`, `locks`, `snapshots`, drop inbox/índice, `replace_all`). |
+| `locks.py` | **NUEVO** — `acquire` (rechazo/TTL), `release` con token. TTL default 15s. |
+| `edits.py` | `write`/`edit`/`delete` agarran lock al inicio y liberan en finally; rechazo informado; `read` ampliada; `list_edits(limit)`; grabación de `replace_all`. |
+| `replay.py` | **NUEVO** — `reconstruct(file, session_id, boundary_edit_id)`. |
+| `snapshot.py` | **NUEVO** — `snapshot_session`, `snapshot_status`, `reconcile_untracked()`. |
+| `session.py` | multi-open; reusuario worktree; target fijada en worktree; abort lógico; `list_sessions()`. |
+| `agents.py` | `register_agent(role, session_id?)`; error duro pasi 2+ open y no `session_id`; `validate_agent` vía `agents.session_id`. |
+| `mcp_server.py` | registrar `snapshot_session`, `snapshot_status`, `list_sessions`, `list_snapshots`; quitar `check_inbox`, `send_message`, `finalize_session`; versión `0.6.0`. |
+| borrado | `inbox.py`, `finalize_*` de session. |
+| docs | `SKILL.md`, `README.md`, `CHANGELOG.md`, `PLAN.md` (este). |
 
 ---
 
-## 7. Agent id flow
+## 12. Tests
 
-The identity problem from MCP is solved by requiring the agent to pass its own id:
+Eliminar `tests/test_inbox.py`.
 
-```
-register_agent(role="implement limiter")
-  → {"agent_id": "a_3f2c"}
-
-# Agent stores a_3f2c and passes it to every subsequent call
-start_intent(agent_id="a_3f2c", intent="...")
-edit(agent_id="a_3f2c", file="src/auth.py", old_string="...", new_string="...")
-check_inbox(agent_id="a_3f2c")
-```
-
-No cwd inference, no environment variable. Harness-agnostic by construction.
-
----
-
-## 8. Concurrency model (best-effort + inbox)
-
-No file locks. On `edit` / `write`:
-
-1. Look up the `edits` table: did another agent edit this `file` within the last `N` seconds (default 30)?
-2. If yes, insert `inbox` rows:
-   - `to = other_agent`, `kind = 'conflict'`, payload = `{file, your_edit_ts, conflicting_agent}`.
-   - `to = self`, `kind = 'conflict'`, payload = `{file, their_edit_ts, conflicting_agent}`.
-3. Atomic write (temp + rename).
-4. Insert `edits` row.
-
-Agents poll `check_inbox` after significant edits and decide how to react: re-read and retry, abort their intent, or push through. Conflicts are advisory, never blocking.
+- **test_db**: migración v2→v3 (DROP inbox/índice, `replace_all`, nuevas tablas, multi-open insert OK).
+- **test_session**: 2 sesiones open a la vez; target worktree compartido; abort última borra worktree vs con otras open NO; `list_sessions`.
+- **test_agents**: `register_agent` obligatorio el `session_id` con 2+ open; validación vía agent.session_id.
+- **test_locks**: lock adquirido/liberado con finally; rechaza write a otro agente (NO aplica); TTL 15s libera huérfano; idempotencia re-mismo agente.
+- **test_edits**: read ampliada (diff+edits+warning siempre); write/edit con lock correcto; rechazo NO aplica recursa y devuelve `read` completo; STALE_WRITE; replace_all grabado.
+- **test_replay**: write/edit/delete/replace_all en frontera; orden ts/id; mismatch→ REPLAY_MISMATCH.
+- **test_snapshot** (punto 4 aconse):
+  - sincroniza el escenario de la sección 9 (a.py/b.py con sesiones A/B, boundary=4)
+  - sin files = todos; nothing-to-snapshot idempotente; el worktree vivo sigue y 2ª iteración de agente.
+- **test_status**: `snapshot_status` lista files/diffs/edits/progress correctos.
+- **test_reconcile**: crash simulado (disco con cambio sin filas) → `snapshot_status` inserta fila sintética.
+- CI: ruff + pytest.
 
 ---
 
-## 9. Atomicity of writes
+## 13. Documentos finales
 
-For every edit / write:
-
-```
-1. Compute final content (in memory).
-2. Write to <file>.tmp.<pid> in the same directory (same filesystem).
-3. fsync (optional, configurable).
-4. os.replace(tmp, file)   # POSIX-atomic on the same filesystem.
-5. Record the edits row.
-```
-
-- Crash between 1–3: no effect on the real file.
-- Crash between 4–5: effect on the file but the row is missing. Recoverable at `finalize_session` via `git status` against the worktree.
-- The file is never observed in a half-written state.
+- `SKILL.md` v0.6.0 (protocolo feromona, lock rechazo, snapshot_status, sin inbox).
+- `README.md` — multiline quick start.
+- `CHANGELOG.md` — `[Unreleased]` con breaking: eliminado inbox/finalize, escaneado de locks, lectura rica, snapshot_status, multi-sesión.
 
 ---
 
-## 10. Stale read handling
+## 14. Decisiones cerradas (v0.6.0)
 
-`edit(agent_id, file, old_string, new_string, replace_all=False)`:
+1. ✅ `register_agent` con 2+ sesiones abiertas sin `session_id` → **error duro**
+2. ✅ TTL lock = **15s**
+3. ✅ Target = **nivel de worktree**; snapshot_status muestra **todo** el worktree vs target
+4. ✅ Sin toggle de diff — `git diff` puro; los snapshots del worktree aspiran a diffs pequeños
+5. ✅ Crash-medio: **reconciliación observada** (`adjusted` rows), no trans-App-máquina
 
-- Read the current file.
-- If `old_string` not found → error `old_string_not_found`. Suggest `read(file)` + retry.
-- If `replace_all=False` and `old_string` matches more than once → error `ambiguous_match`. Suggest `replace_all=True` or more context.
-- If `replace_all=True` → replace all occurrences.
+## 15. Orden de implementación
 
-No mtime-based proactive rejection. Agents are responsible for re-reading after a conflict notification.
-
----
-
-## 11. Finalize flow
-
-```
-finalize_session(message="feat: rate limit")
-  1. require session.state == 'open'
-  2. warn (do not block) if any agents have ended_at IS NULL
-  3. git -C <worktree> add -A
-  4. git -C <worktree> commit -m <message> [--author ...]
-  5. detached temp worktree on <target_branch>
-  6. squash / cherry-pick the worktree commit
-  7. commit on temp worktree with the final message
-  8. git update-ref <target_branch> <new_sha>
-  9. git worktree remove <worktree>; prune
- 10. session.state = 'finalized'; final_sha = new_sha
- 11. append to .gitagent/log.jsonl (legacy audit log)
-```
-
-Reuses the git plumbing patterns from v0.4.2 (`gitwrap.py`).
+1. Rama `feat/v0.6-...`.. `git checkout -b feat/v0.6-pheromone-snapshot` + migraciones.
+2. `db.py` (migración v3) + tests.
+3. `locks.py` (`acquire`/`release`, TTL 15) + tests.
+4. `edits.py` (locks en edit/write/delete, rechazo, read ampliado, warning, `list_edits(limit)`) + tests.
+5. `replay.py` reconstrución + tests.
+6. `snapshot.py` (`snapshot_session`, `snapshot_status`, `reconcile`) + tests (punto 4 + crash).
+7. `agents.py`/`session.py` multi-sesión + target por worktree + tests.
+8. `mcp_server.py` tools + versión.
+9. ruff + pytest, E2E manual do (a y b, compartidas).
+10. Docs.
 
 ---
 
-## 12. Skill (`SKILL.md`) content
-
-The bundled skill is rewritten to teach the new workflow:
-
-```markdown
-# gitagent (v0.5.0)
-
-You are a subagent inside a gitagent session.
-
-## Hard rule
-**Use `gitagent_mcp__edit` and `gitagent_mcp__write` for ALL file changes.**
-Do NOT use the host's Edit/Write tools. Host tools bypass attribution and
-conflict tracking. If you use them, your changes are invisible to your peers
-and to the orchestrator.
-
-## Workflow
-1. `register_agent(role="...")` → store the returned `agent_id`.
-2. `start_intent(agent_id, intent="...")` before your first edit.
-3. Use `edit` / `write` / `read` / `delete_file` for changes.
-4. `repurpose(agent_id, intent)` whenever your focus shifts.
-5. `check_inbox(agent_id)` after each significant change.
-6. `send_message` to coordinate with peers explicitly.
-7. When done, tell the orchestrator. Do NOT call `finalize_session` yourself.
-
-## Conflict protocol
-If `check_inbox` returns a `conflict` message:
-- `read` the conflicting file.
-- Re-plan your edit with the new content.
-- Retry via `edit` / `write`.
-```
-
----
-
-## 13. File structure
-
-```
-src/gitagent/
-  mcp_server.py      # FastMCP entrypoint + tool registration
-  db.py              # sqlite wrapper, migrations (PRAGMA user_version)
-  session.py         # start_session, finalize_session, abort_session, get_session
-  agents.py          # register_agent, unregister_agent, list_agents
-  intents.py         # start_intent, repurpose, get_current_intent
-  edits.py           # edit, write, read, delete_file + atomic write + conflict detection
-  inbox.py           # check_inbox, send_message
-  gitwrap.py         # unchanged (reused)
-  (delete) cli.py, store.py, proposals.py, review.py, finalize.py
-```
-
-New dependency: `mcp` (or `fastmcp`).
-
----
-
-## 14. Backward compatibility / migration
-
-- v0.5.0 is a total break. No compat with v0.4.2.
-- `feat/mcp-sqlite-core` stays isolated until the user validates end-to-end.
-- The merge to `main` deletes the deprecated files (`cli.py`, `store.py`, `proposals.py`, `review.py`, `finalize.py`) in a single clean commit.
-- `CHANGELOG.md` gains an `Unreleased` v0.5.0 section explaining the break.
-- `README.md` is rewritten for the MCP-only workflow.
-- The legacy `.gitagent/log.jsonl` audit log is preserved as a finalization artifact (append-only summary of sessions and conflicts).
-
----
-
-## 15. Open issues (resolvable during implementation)
-
-1. **`finalize_session` with live agents**: warn vs. block. Default: warn, do not block.
-2. **`start_session` while one is `open`**: clear error explaining `finalize_session` / `abort_session` is required first.
-3. **Agent from a previous session acting in a new one**: error (`agent not in current session`); the agent must `register_agent` again.
-4. **MCP server starts before `.gitagent/` exists**: lazy init on the first tool call that touches the DB.
-5. **`start_intent` required before `edit`**: enforcement vs. warn. Default: warn (stderr + inbox entry), do not block.
-6. **Filesystem watcher for out-of-MCP writes**: skip in v0.5.0. Consider for v0.6.0 once prompt-only enforcement is validated.
-7. **Conflict window default (N seconds)**: default 30. Make it configurable per session (`start_session(..., conflict_window_seconds=30)`).
-
----
-
-## 16. Implementation steps (when leaving plan mode)
-
-1. `git checkout -b feat/mcp-sqlite-core`
-2. Create `db.py` with schema + migrations.
-3. Create `session.py` (`start_session`, `finalize_session`, `abort_session`, `get_session`).
-4. Create `agents.py` (`register_agent`, `unregister_agent`, `list_agents`).
-5. Create `intents.py` (`start_intent`, `repurpose`, `get_current_intent`).
-6. Create `edits.py` (atomic write, conflict detection, `edit`/`write`/`read`/`delete_file`).
-7. Create `inbox.py` (`check_inbox`, `send_message`).
-8. Create `mcp_server.py` (FastMCP entrypoint; registers all tools).
-9. Rewrite `SKILL.md` with the v0.5.0 workflow.
-10. Tests:
-    - `tests/test_db.py` — schema, migrations, indexes.
-    - `tests/test_session.py` — single-worktree invariant, finalize commit on target.
-    - `tests/test_agents.py` — auto-id, ended_at, validation.
-    - `tests/test_intents.py` — start/repurpose ordering, current pointer.
-    - `tests/test_edits.py` — atomic write, old_string match, conflict detection.
-    - `tests/test_inbox.py` — unread/read transitions, conflict payload.
-    - `tests/test_mcp_server.py` — in-process MCP tool calls end-to-end.
-11. Manual E2E: spawn 3 agents, edit overlapping files, verify inbox notifications, `finalize_session`, verify single commit on `main`.
-12. Update `README.md` (MCP-only workflow) and `CHANGELOG.md` (Unreleased v0.5.0 section).
+*Este documento es el AST+SINGULAR destino para la implementación v0.6.0. Toda decisión nueva de v0.6 va a este archivo ANTES de codificar.*

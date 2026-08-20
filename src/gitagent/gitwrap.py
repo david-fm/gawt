@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 from .errors import GitAgentError
@@ -157,3 +159,130 @@ def update_ref(ref: str, sha: str, cwd: Path | str | None = None) -> None:
 def unmerged_files(cwd: Path | str | None = None) -> list[str]:
     out = run(["diff", "--name-only", "--diff-filter=U"], cwd=cwd)
     return [line for line in out.splitlines() if line.strip()]
+
+
+def file_exists_at(ref: str, file: str, cwd: Path | str | None = None) -> bool:
+    """True if *file* exists in the tree at *ref*."""
+    try:
+        run(["cat-file", "-e", f"{ref}:{file}"], cwd=cwd)
+        return True
+    except GitAgentError:
+        return False
+
+
+def file_content_at(
+    ref: str, file: str, cwd: Path | str | None = None
+) -> str | None:
+    """Return the blob content of *file* at *ref*, or None if absent."""
+    raw = blob_bytes(ref, file, cwd=cwd)
+    if raw is None:
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def blob_bytes(
+    ref: str, file: str, cwd: Path | str | None = None
+) -> bytes | None:
+    """Return the raw blob content of *file* at *ref*, or None if absent."""
+    proc = subprocess.run(
+        ["git", "cat-file", "blob", f"{ref}:{file}"],
+        cwd=str(cwd) if cwd is not None else None,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def list_files_vs_ref(
+    ref: str, cwd: Path | str | None = None
+) -> dict[str, str]:
+    """Map of {file: status} for files that differ from *ref* in the worktree.
+
+    Status is one of 'added', 'modified', 'deleted'. Comparison is blob-vs-disk
+    (index-independent): the live worktree index never tracks agent writes, so
+    relying on ``git diff`` would miscount files already committed to *ref*.
+    """
+    wt = Path(cwd).resolve()
+
+    tracked = set(
+        line
+        for line in _run(
+            ["ls-tree", "-r", "--name-only", ref], cwd=cwd, check=True
+        ).splitlines()
+        if line.strip() and not line.strip().startswith(".git/")
+    )
+
+    disk: set[str] = set()
+    for root, dirs, files in os.walk(wt, followlinks=False):
+        root_rel = Path(root).resolve().relative_to(wt)
+        # Skip any nested repo internals (e.g. a nested .git or worktree hooks).
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for fname in files:
+            if fname == ".git":
+                continue
+            rel = root_rel / fname
+            disk.add(rel.as_posix() if str(rel) != "." else fname)
+
+    result: dict[str, str] = {}
+    for f in sorted(tracked - disk):
+        result[f] = "deleted"
+    for f in sorted(tracked & disk):
+        target = blob_bytes(ref, f, cwd=cwd)
+        if target is not None and target != (wt / f).read_bytes():
+            result[f] = "modified"
+    for f in sorted(disk - tracked):
+        result[f] = "added"
+    return result
+
+
+def diff_vs_ref(
+    ref: str, file: str, cwd: Path | str | None = None
+) -> tuple[str, str]:
+    """Return ``(status, diff_text)`` for *file* vs *ref* using blob-vs-disk.
+
+    Diff text is produced with ``git diff --no-index`` between the target
+    blob and the current disk content, so index state does not matter.
+    """
+    wt = Path(cwd).resolve()
+    disk_path = wt / file
+    target = blob_bytes(ref, file, cwd=cwd)
+
+    if target is None and not disk_path.exists():
+        return "clean", ""
+    if target is None:
+        out = _run(
+            ["diff", "--no-index", "--no-color", "/dev/null", str(disk_path)],
+            cwd=cwd,
+            check=False,
+        )
+        return "added", out
+    if not disk_path.exists():
+        fd, tmp = tempfile.mkstemp(suffix=f".{Path(file).name}")
+        try:
+            os.close(fd)
+            with open(tmp, "wb") as fh:
+                fh.write(target)
+            out = _run(
+                ["diff", "--no-index", "--no-color", tmp, "/dev/null"],
+                cwd=cwd,
+                check=False,
+            )
+        finally:
+            os.unlink(tmp)
+        return "deleted", out
+    if target == disk_path.read_bytes():
+        return "clean", ""
+    fd, tmp = tempfile.mkstemp(suffix=f".{Path(file).name}")
+    try:
+        os.close(fd)
+        with open(tmp, "wb") as fh:
+            fh.write(target)
+        out = _run(
+            ["diff", "--no-index", "--no-color", tmp, str(disk_path)],
+            cwd=cwd,
+            check=False,
+        )
+    finally:
+        os.unlink(tmp)
+    return "modified", out

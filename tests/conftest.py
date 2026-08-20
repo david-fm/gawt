@@ -1,4 +1,4 @@
-"""Shared fixtures for gitagent v0.5.0 tests."""
+"""Shared fixtures for gitagent v0.6.0 tests."""
 from __future__ import annotations
 
 import subprocess
@@ -23,7 +23,6 @@ def tmp_repo(tmp_path: Path):
         ["git", "config", "user.name", "Test"],
         cwd=str(repo), check=True, capture_output=True,
     )
-    # Initial commit so HEAD exists
     (repo / "README.md").write_text("# test\n")
     subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
     subprocess.run(
@@ -53,20 +52,25 @@ def repo_with_gitagent(tmp_repo: Path, tmp_db: Database):
     import gitagent.agents as agents_mod
     import gitagent.db as db_mod
     import gitagent.edits as edits_mod
-    import gitagent.inbox as inbox_mod
     import gitagent.intents as intents_mod
+    import gitagent.locks as locks_mod
+    import gitagent.replay as replay_mod
     import gitagent.session as session_mod
+    import gitagent.snapshot as snapshot_mod
 
     # Patch get_db to return our test db
     db_mod.get_db = lambda path=None: tmp_db
     session_mod.get_db = lambda path=None: tmp_db
     agents_mod.get_db = lambda path=None: tmp_db
     edits_mod.get_db = lambda path=None: tmp_db
-    inbox_mod.get_db = lambda path=None: tmp_db
+    locks_mod.get_db = lambda path=None: tmp_db
+    replay_mod.get_db = lambda path=None: tmp_db
+    snapshot_mod.get_db = lambda path=None: tmp_db
     intents_mod.get_db = lambda path=None: tmp_db
 
     # Patch repo_root to return our tmp_repo
     import gitagent.gitwrap as gw
+
     _orig_repo_root = gw.repo_root
     gw.repo_root = lambda cwd=None: tmp_repo
 
@@ -77,9 +81,11 @@ def repo_with_gitagent(tmp_repo: Path, tmp_db: Database):
 
     # Restore
     gw.repo_root = _orig_repo_root
-    db_mod.get_db = db_mod.get_db  # restore original
+    db_mod.get_db = db_mod.get_db
     session_mod.get_db = session_mod.get_db
     agents_mod.get_db = agents_mod.get_db
     edits_mod.get_db = edits_mod.get_db
-    inbox_mod.get_db = inbox_mod.get_db
+    locks_mod.get_db = locks_mod.get_db
+    replay_mod.get_db = replay_mod.get_db
+    snapshot_mod.get_db = snapshot_mod.get_db
     intents_mod.get_db = intents_mod.get_db
