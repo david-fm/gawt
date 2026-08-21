@@ -337,6 +337,13 @@ Eliminar `tests/test_inbox.py`.
 4. ✅ `list_edits` resuelve `intent` texto y `role` (JOIN) para trazabilidad sin llamadas extra.
 5. Migración `user_version` 3 → 4: `CREATE TABLE last_reads(agent_id, file, sha256, ts, PRIMARY KEY(agent_id, file))`.
 
+## 14b. Regla A — v0.6.2 (hueco de creación en raza)
+
+**Escribir un archivo nunca leído es stale.** Un archivo existente que el agente **nunca leyó** (`last_reads` sin fila) se trata como clobber potencial: `write` / `edit` / `delete` se rechazan con `STALE_WRITE`. El creador del archivo (su `last_reads` se registra al crearlo) puede reescribirlo; cualquier otro debe `read_file` antes de tocarlo. Cierra el hueco donde dos agentes creaban el mismo archivo en raza de forma secuencial (B pisaba a A sin aviso).
+
+- Anteriormente `_stale_against_read` devolvía `False` si no había `last_reads`. Ahora devuelve `True` (never-read cuenta como stale) cuando el archivo existe.
+- Flujos legítimos que necesitaban ajustarse para cumplir la regla (leer antes de tocar) actualizados en tests.
+
 ## 15. Orden de implementación
 
 1. Rama `feat/v0.6-...`.. `git checkout -b feat/v0.6-pheromone-snapshot` + migraciones.

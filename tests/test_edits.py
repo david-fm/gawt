@@ -56,6 +56,7 @@ def test_read_note_when_stale(repo_with_gitagent):
 
     edits.write(aid, "f.txt", "v1", db=db)
     edits.read(aid, "f.txt", db=db)  # agent records last_read = v1
+    edits.read(aid2, "f.txt", db=db)  # the other agent also reads before writing
     edits.write(aid2, "f.txt", "v2", db=db)  # another agent changes it
 
     r = edits.read(aid, "f.txt", db=db)
@@ -135,18 +136,59 @@ def test_write_after_own_read_applies(repo_with_gitagent):
     assert resp["ok"] is True
 
 
+def test_write_never_read_existing_rejected(repo_with_gitagent):
+    """Option A: writing a file you never read is stale (not silent clobber)."""
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    aid2 = agents.register_agent("other", db=db)["agent_id"]
+
+    edits.write(aid, "f.txt", "v1", db=db)      # other agent owns it
+    resp = edits.write(aid2, "f.txt", "v2", db=db)  # never read -> reject
+    assert resp["status"] == "rejected"
+    assert resp["reason"] == "STALE_WRITE"
+
+
+def test_creator_can_rewrite_own_file(repo_with_gitagent):
+    """A file's creator (its own last_reads row set on create) may rewrite it."""
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    edits.write(aid, "f.txt", "v1", db=db)   # sets last_reads for the creator
+    edits.write(aid, "f.txt", "v2", db=db)
+    assert edits.read(aid, "f.txt", db=db)["content"] == "v2"
+
+
+def test_edit_never_read_existing_rejected(repo_with_gitagent):
+    """Editing a file you never read is refused (must read first for old_string)."""
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    aid2 = agents.register_agent("other", db=db)["agent_id"]
+
+    edits.write(aid, "f.txt", "abc", db=db)
+    resp = edits.edit(aid2, "f.txt", "abc", "xyz", db=db)
+    assert resp["status"] == "rejected"
+    assert resp["reason"] == "STALE_WRITE"
+
+
+def test_delete_never_read_existing_rejected(repo_with_gitagent):
+    """Deleting a file you never read is refused too."""
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    aid2 = agents.register_agent("other", db=db)["agent_id"]
+
+    edits.write(aid, "f.txt", "keep", db=db)
+    resp = edits.delete_file(aid2, "f.txt", db=db)
+    assert resp["status"] == "rejected"
+    assert resp["reason"] == "STALE_WRITE"
+
+
 def test_write_stale_after_other_writes(repo_with_gitagent):
     repo, db, aid, _ = _setup_agent(repo_with_gitagent)
     aid2 = agents.register_agent("other", db=db)["agent_id"]
 
     edits.write(aid, "f.txt", "v1", db=db)
-    edits.read(aid, "f.txt", db=db)     # agent A bases its write on v1
+    edits.read(aid, "f.txt", db=db)        # A bases its write on v1
+    edits.read(aid2, "f.txt", db=db)       # B reads before writing
     edits.write(aid2, "f.txt", "v2", db=db)  # B changes it
 
     resp = edits.write(aid, "f.txt", "A-wins", db=db)
     assert resp["status"] == "rejected"
     assert resp["reason"] == "STALE_WRITE"
-    # Nothing clobbered: disk still holds B's version.
     assert edits.read(aid, "f.txt", db=db)["content"] == "v2"
 
 
@@ -156,6 +198,7 @@ def test_edit_stale_after_other_writes(repo_with_gitagent):
 
     edits.write(aid, "f.txt", "v1", db=db)
     edits.read(aid, "f.txt", db=db)
+    edits.read(aid2, "f.txt", db=db)
     edits.write(aid2, "f.txt", "v2", db=db)
     resp = edits.edit(aid, "f.txt", "hello", "world", db=db)
     assert resp["status"] == "rejected"
@@ -168,6 +211,7 @@ def test_delete_stale_after_other_writes(repo_with_gitagent):
 
     edits.write(aid, "f.txt", "v1", db=db)
     edits.read(aid, "f.txt", db=db)
+    edits.read(aid2, "f.txt", db=db)
     edits.write(aid2, "f.txt", "v2", db=db)
     resp = edits.delete_file(aid, "f.txt", db=db)
     assert resp["status"] == "rejected"

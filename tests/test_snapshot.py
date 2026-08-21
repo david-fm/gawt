@@ -30,7 +30,10 @@ def test_snapshot_point4_scenario(repo_with_gitagent):
 
     # S1 (a1): writes a.py (id=1) and b.py (id=2)
     edits.write(a1, "a.py", "A1", db=db)
-    edits.write(a2, "b.py", "B1", db=db)
+    edits.write(a1, "b.py", "B1", db=db)
+    # S2 (a2) edits files created by a1 — must read them first (protocol A).
+    edits.read(a2, "a.py", db=db)
+    edits.read(a2, "b.py", db=db)
     # S2 (a2): edits b.py (id=3) and a.py (id=4)
     edits.edit(a2, "b.py", "B1", "B2", db=db)
     edits.edit(a2, "a.py", "A1", "A2", db=db)

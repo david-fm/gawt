@@ -11,7 +11,7 @@ from mcp.server import MCPServer
 from . import agents, edits, intents, session, snapshot
 from .errors import GitAgentError
 
-server = MCPServer("gitagent", version="0.6.1")
+server = MCPServer("gitagent", version="0.6.2")
 
 
 def _err(e: Exception) -> dict[str, str]:

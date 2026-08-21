@@ -126,13 +126,20 @@ def _clear_last_read(agent_id: str, file: str, db: Database) -> None:
 
 
 def _stale_against_read(agent_id: str, file: str, current_sha: str | None, db: Database) -> bool:
-    """True if this agent read the file before but the disk changed since.
+    """True if *file* should not be written by this agent right now.
 
-    The agent never passes a SHA anymore — gawt remembers the last read.
+    Stale when:
+    - the agent never read the file (it likely belongs to someone else), or
+    - the disk changed since the agent's last read (a file with an existing
+      ``last_reads`` row whose SHA differs).
+
+    The agent never passes a SHA — gawt remembers the last read. This is the
+    "A" rule: an existing file the agent has never read is treated as a
+    potential clobber, so a blind write is refused with STALE_WRITE.
     """
     prev = _last_read(agent_id, file, db)
     if prev is None:
-        return False
+        return True
     return prev["sha256"] != current_sha
 
 
