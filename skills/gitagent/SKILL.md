@@ -3,7 +3,7 @@ name: gitagent
 description: 'Use this skill when you (or another agent you supervise) need to coordinate multi-agent coding work over Git via MCP — shared worktree, pheromone edit tracking with semantic intents, per-file write locks with informed rejection, partial snapshots per orchestrator. Triggers on "gitagent", "multi-agent git workflow", "coordinate agents", "shared worktree". Do NOT use for: general git questions, single-developer workflows, or non-agent coordination tasks.'
 ---
 
-# gitagent (v0.6.0)
+# gitagent (v0.6.1)
 
 MCP-first agent workspace manager. **One shared worktree**, live edit tracking in SQLite (the **pheromone**), semantic intents, per-file write locks with informed rejection, and **partial snapshots** per orchestrator. No inbox — coordination emerges from the edit log. No CLI — all operations via MCP tools over stdio.
 
@@ -142,7 +142,7 @@ If you see a rejected write:
 ## Recoveries
 
 - **Crash mid-write**: disk is the source of truth. `snapshot_status` detects disk changes with no matching pheromone row and inserts a synthetic `{op: 'adjusted'}` attribution so replay never fails.
-- **STALE_WRITE**: if a write's `expected_sha256` no longer matches after acquiring the lock, the write is rejected with `reason: "STALE_WRITE"` — re-read and retry.
+- **STALE_WRITE**: gawt remembers your last read of each file. If the disk changed since that read (another agent wrote), the write is rejected with `reason: "STALE_WRITE"` — re-read and retry. You never pass a SHA.
 - **Orphaned lock**: a lock older than `lock_ttl_seconds` (default 15s) is reclaimed as crash residue.
 
 ---
@@ -186,10 +186,10 @@ If you see a rejected write:
 
 | Tool | Effect |
 |---|---|
-| `edit_file(agent_id, file, old_string, new_string, replace_all=False, expected_sha256=None)` | Exact match + atomic write. |
-| `write_file(agent_id, file, content, expected_sha256=None)` | Create / overwrite. Atomic write. |
-| `read_file(agent_id, file)` | Informed read: `{content, sha256, path, base_sha, diff, edits[], warning}`. |
-| `delete_file(agent_id, file, expected_sha256=None)` | Removes file. |
+| `edit_file(agent_id, file, old_string, new_string, replace_all=False)` | Exact match + atomic write. |
+| `write_file(agent_id, file, content)` | Create / overwrite. Atomic write. |
+| `read_file(agent_id, file)` | Informed read: `{content, sha256, path, base_sha, edits[](op, role, intent, ts), warning}`. |
+| `delete_file(agent_id, file)` | Removes file. |
 
 ### Observability
 

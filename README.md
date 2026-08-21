@@ -2,7 +2,7 @@
 
 > MCP-first agent workspace manager: shared worktree, pheromone edit tracking, semantic intents, per-file locks, partial snapshots.
 
-`gitagent` v0.6.0 is a total rewrite. The CLI is gone — all operations are exposed as **MCP tools** over stdio. Multiple sessions share ONE global worktree. Every edit is tracked in SQLite with full attribution (the **pheromone**). Coordination — no inbox — emerges from the edit log. Writes acquire per-file locks and **reject informed** on conflict; orchestrators publish their part via **partial snapshots**.
+`gitagent` v0.6.1 is a total rewrite. The CLI is gone — all operations are exposed as **MCP tools** over stdio. Multiple sessions share ONE global worktree. Every edit is tracked in SQLite with full attribution (the **pheromone**). Coordination — no inbox — emerges from the edit log. Writes acquire per-file locks and **reject informed** (auto-STALE via last-read tracking) on conflict; orchestrators publish their part via **partial snapshots**.
 
 ## Install
 
@@ -77,7 +77,8 @@ All editing/intent tools require `agent_id` per call.
 - **Shared worktree**: one detached worktree at `.gitagent/worktree/`, shared by all sessions and their agents.
 - **Pheromone**: every `edit_file` / `write_file` / `delete_file` records `(agent_id, session_id, file, intent_id, op, ts)` in SQLite — a traceable "I edited this, with this intent".
 - **Per-file locks**: writes acquire a lock first and always release it in `finally` (TTL default 15s reclaims orphans). A fresh foreign lock → informed `rejected` response with the current `read`.
-- **Informed reads**: `read_file` returns content + sha256 + `base_sha` + `diff` + `edits[]` + intent `warning`.
+- **Informed reads**: `read_file` returns content + sha256 + `base_sha` + `edits[]` (each with `op`, `role`, `intent`, `ts`) + intent `warning` — no fat diff payload. The git diff lives in `snapshot_status`.
+- **Auto STALE_WRITE**: gawt remembers each agent's last read per file (`last_reads`) and rejects a write with `STALE_WRITE` if the disk changed since. Agents never pass or manage a SHA.
 - **Atomic writes**: all writes go through temp + `os.replace` (POSIX-atomic); disk is the source of truth.
 - **Partial snapshots**: `snapshot_session` commits *part* of the worktree onto the target branch via a detached temp worktree, without touching the live worktree. Per-file `snapshot_progress` tracks each session's frontier.
 - **Crash reconciliation**: `snapshot_status` inserts synthetic `adjusted` rows for disk changes with no pheromone entry, so `replay` never fails on crash residue.

@@ -11,7 +11,7 @@ from mcp.server import MCPServer
 from . import agents, edits, intents, session, snapshot
 from .errors import GitAgentError
 
-server = MCPServer("gitagent", version="0.6.0")
+server = MCPServer("gitagent", version="0.6.1")
 
 
 def _err(e: Exception) -> dict[str, str]:
@@ -182,34 +182,29 @@ def edit_file(
     old_string: str,
     new_string: str,
     replace_all: bool = False,
-    expected_sha256: str | None = None,
 ) -> dict:
-    """Exact-match string replacement. Rejects (with read payload) on lock."""
+    """Exact-match string replacement. Validates against the agent's last read."""
     try:
         return edits.edit(
             agent_id, file, old_string, new_string,
-            replace_all=replace_all, expected_sha256=expected_sha256,
+            replace_all=replace_all,
         )
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
-def write_file(
-    agent_id: str, file: str, content: str, expected_sha256: str | None = None
-) -> dict:
+def write_file(agent_id: str, file: str, content: str) -> dict:
     """Create or overwrite a file atomically under a per-file lock."""
     try:
-        return edits.write(
-            agent_id, file, content, expected_sha256=expected_sha256
-        )
+        return edits.write(agent_id, file, content)
     except GitAgentError as e:
         return _err(e)
 
 
 @server.tool()
 def read_file(agent_id: str, file: str) -> dict:
-    """Informed read: content + sha256 + base_sha + diff + edits + warning."""
+    """Informed read: content + sha256 + base_sha + edits (with intent) + note/warning."""
     try:
         return edits.read(agent_id, file)
     except GitAgentError as e:
@@ -217,12 +212,10 @@ def read_file(agent_id: str, file: str) -> dict:
 
 
 @server.tool()
-def delete_file(
-    agent_id: str, file: str, expected_sha256: str | None = None
-) -> dict:
+def delete_file(agent_id: str, file: str) -> dict:
     """Remove a file under a per-file lock."""
     try:
-        return edits.delete_file(agent_id, file, expected_sha256=expected_sha256)
+        return edits.delete_file(agent_id, file)
     except GitAgentError as e:
         return _err(e)
 

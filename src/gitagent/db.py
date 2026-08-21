@@ -16,7 +16,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-CURRENT_VERSION = 3
+CURRENT_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS session (
@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS snapshots (
     sha              TEXT NOT NULL,
     ts               TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS last_reads (
+    agent_id   TEXT NOT NULL,
+    file       TEXT NOT NULL,
+    sha256     TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    PRIMARY KEY (agent_id, file)
+);
 """
 
 _COLUMN_EXISTS = (
@@ -145,6 +153,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
             files            TEXT NOT NULL,
             sha              TEXT NOT NULL,
             ts               TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS last_reads (
+            agent_id   TEXT NOT NULL,
+            file       TEXT NOT NULL,
+            sha256     TEXT NOT NULL,
+            ts         TEXT NOT NULL,
+            PRIMARY KEY (agent_id, file)
         );
         """
     )

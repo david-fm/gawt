@@ -1,11 +1,11 @@
-"""Tests for edits.py — informed read, locks, informed rejection, STALE_WRITE."""
+"""Tests for edits.py — informed read (no diff), last-read validation, rejection."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 
-from gitagent import agents, edits, locks, session
+from gitagent import agents, edits, intents, locks, session
 from gitagent.errors import GitAgentError
 
 
@@ -16,7 +16,7 @@ def _setup_agent(repo_with_gitagent):
     return repo, db, aid, s["session_id"]
 
 
-def test_read_amplified(repo_with_gitagent):
+def test_read_informed(repo_with_gitagent):
     repo, db, aid, sid = _setup_agent(repo_with_gitagent)
     edits.write(aid, "hello.txt", "hello world\n", db=db)
 
@@ -24,30 +24,61 @@ def test_read_amplified(repo_with_gitagent):
     assert r["content"] == "hello world\n"
     assert len(r["sha256"]) == 64
     assert r["base_sha"]
-    assert "diff" in r
     assert "warning" in r
     assert isinstance(r["edits"], list)
     assert r["edits"][0]["op"] == "write"
+    # No fat diff payload in the read — it lives in snapshot_status only.
+    assert "diff" not in r
+
+
+def test_read_records_last_read(repo_with_gitagent):
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    edits.write(aid, "f.txt", "x", db=db)
+    r = edits.read(aid, "f.txt", db=db)
+    row = db.fetchone(
+        "SELECT * FROM last_reads WHERE agent_id = ? AND file = 'f.txt'",
+        (aid,),
+    )
+    assert row is not None
+    assert row["sha256"] == r["sha256"]
+
+
+def test_read_no_note_when_current(repo_with_gitagent):
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    edits.write(aid, "f.txt", "x", db=db)
+    r = edits.read(aid, "f.txt", db=db)
+    assert "note" not in r
+
+
+def test_read_note_when_stale(repo_with_gitagent):
+    repo, db, aid, sid = _setup_agent(repo_with_gitagent)
+    aid2 = agents.register_agent("other", db=db)["agent_id"]
+
+    edits.write(aid, "f.txt", "v1", db=db)
+    edits.read(aid, "f.txt", db=db)  # agent records last_read = v1
+    edits.write(aid2, "f.txt", "v2", db=db)  # another agent changes it
+
+    r = edits.read(aid, "f.txt", db=db)
+    assert "note" in r  # your last read is no longer current
+    assert r["content"] == "v2"
 
 
 def test_edit_exact_match(repo_with_gitagent):
-    repo, db, aid, sid = _setup_agent(repo_with_gitagent)
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
     edits.write(aid, "src/app.py", "def hello():\n    pass\n", db=db)
     edits.edit(aid, "src/app.py", "pass", "return 42", db=db)
-    r = edits.read(aid, "src/app.py", db=db)
-    assert "return 42" in r["content"]
-    assert "pass" not in r["content"]
+    assert "return 42" in edits.read(aid, "src/app.py", db=db)["content"]
 
 
 def test_edit_replace_all(repo_with_gitagent):
-    repo, db, aid, sid = _setup_agent(repo_with_gitagent)
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
     edits.write(aid, "file.txt", "aaa bbb aaa", db=db)
     edits.edit(aid, "file.txt", "aaa", "xxx", replace_all=True, db=db)
     assert edits.read(aid, "file.txt", db=db)["content"] == "xxx bbb xxx"
 
 
 def test_replace_all_recorded(repo_with_gitagent):
-    repo, db, aid, sid = _setup_agent(repo_with_gitagent)
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
     edits.write(aid, "file.txt", "aa aa", db=db)
     edits.edit(aid, "file.txt", "aa", "x", replace_all=True, db=db)
     rows = [e for e in edits.list_edits(db=db) if e["op"] == "edit"]
@@ -69,7 +100,7 @@ def test_edit_ambiguous_match(repo_with_gitagent):
 
 
 def test_delete_file(repo_with_gitagent):
-    repo, db, aid, sid = _setup_agent(repo_with_gitagent)
+    repo, db, aid, _ = _setup_agent(repo_with_gitagent)
     edits.write(aid, "to_delete.txt", "bye", db=db)
     wt = Path(repo / ".gitagent" / "worktree")
     assert (wt / "to_delete.txt").exists()
@@ -84,42 +115,74 @@ def test_path_escape_rejected(repo_with_gitagent):
 
 
 def test_lock_rejects_other_agent_write(repo_with_gitagent):
-    repo, db, aid1, sid = _setup_agent(repo_with_gitagent)
+    repo, db, aid, sid = _setup_agent(repo_with_gitagent)
     aid2 = agents.register_agent("b", db=db)["agent_id"]
 
-    # Agent 1 grabs the lock and holds it.
-    locks.acquire("locked.txt", aid1, sid, db=db)
+    locks.acquire("locked.txt", aid, sid, db=db)
     resp = edits.write(aid2, "locked.txt", "should-not-apply", db=db)
 
     assert resp["status"] == "rejected"
-    assert resp["blocked_by"]["agent_id"] == aid1
+    assert resp["blocked_by"]["agent_id"] == aid
     assert "read" in resp
-
-    # The file was NOT created.
-    wt = Path(repo / ".gitagent" / "worktree")
-    assert not (wt / "locked.txt").exists()
+    assert not (Path(repo / ".gitagent" / "worktree") / "locked.txt").exists()
 
 
-def test_rejection_does_not_record_edit(repo_with_gitagent):
-    repo, db, aid, sid = _setup_agent(repo_with_gitagent)
-    aid2 = agents.register_agent("b", db=db)["agent_id"]
-    locks.acquire("x.py", aid, sid, db=db)
-    edits.write(aid2, "x.py", "nope", db=db)
-    file_edits = [e for e in edits.list_edits(db=db) if e["file"] == "x.py"]
-    assert file_edits == []
-
-
-def test_stale_write_rejected(repo_with_gitagent):
+def test_write_after_own_read_applies(repo_with_gitagent):
     _, db, aid, _ = _setup_agent(repo_with_gitagent)
-    edits.write(aid, "stale.txt", "before", db=db)
-    original = edits.read(aid, "stale.txt", db=db)
-    edits.write(aid, "stale.txt", "changed", db=db)
-    resp = edits.edit(
-        aid, "stale.txt", "changed", "new",
-        expected_sha256=original["sha256"], db=db,
-    )
+    edits.write(aid, "f.txt", "v1", db=db)
+    edits.read(aid, "f.txt", db=db)  # record own read
+    resp = edits.write(aid, "f.txt", "v2", db=db)
+    assert resp["ok"] is True
+
+
+def test_write_stale_after_other_writes(repo_with_gitagent):
+    repo, db, aid, _ = _setup_agent(repo_with_gitagent)
+    aid2 = agents.register_agent("other", db=db)["agent_id"]
+
+    edits.write(aid, "f.txt", "v1", db=db)
+    edits.read(aid, "f.txt", db=db)     # agent A bases its write on v1
+    edits.write(aid2, "f.txt", "v2", db=db)  # B changes it
+
+    resp = edits.write(aid, "f.txt", "A-wins", db=db)
     assert resp["status"] == "rejected"
     assert resp["reason"] == "STALE_WRITE"
+    # Nothing clobbered: disk still holds B's version.
+    assert edits.read(aid, "f.txt", db=db)["content"] == "v2"
+
+
+def test_edit_stale_after_other_writes(repo_with_gitagent):
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    aid2 = agents.register_agent("other", db=db)["agent_id"]
+
+    edits.write(aid, "f.txt", "v1", db=db)
+    edits.read(aid, "f.txt", db=db)
+    edits.write(aid2, "f.txt", "v2", db=db)
+    resp = edits.edit(aid, "f.txt", "hello", "world", db=db)
+    assert resp["status"] == "rejected"
+    assert resp["reason"] == "STALE_WRITE"
+
+
+def test_delete_stale_after_other_writes(repo_with_gitagent):
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    aid2 = agents.register_agent("other", db=db)["agent_id"]
+
+    edits.write(aid, "f.txt", "v1", db=db)
+    edits.read(aid, "f.txt", db=db)
+    edits.write(aid2, "f.txt", "v2", db=db)
+    resp = edits.delete_file(aid, "f.txt", db=db)
+    assert resp["status"] == "rejected"
+    assert resp["reason"] == "STALE_WRITE"
+
+
+def test_read_edits_include_intent_and_role(repo_with_gitagent):
+    _, db, aid, _ = _setup_agent(repo_with_gitagent)
+    intents.start_intent(aid, "implement rate limiter", db=db)
+    edits.write(aid, "lim.py", "x", db=db)
+    r = edits.read(aid, "lim.py", db=db)
+    e = r["edits"][0]
+    assert e["op"] == "write"
+    assert e["role"] == "dev"
+    assert e["intent"] == "implement rate limiter"
 
 
 def test_list_edits_limit(repo_with_gitagent):

@@ -93,6 +93,7 @@ def test_schema_creation(tmp_path: Path):
     assert "snapshot_progress" in tables
     assert "locks" in tables
     assert "snapshots" in tables
+    assert "last_reads" in tables
     # Inbox is gone in v0.6.
     assert "inbox" not in tables
     db.close()
@@ -102,7 +103,7 @@ def test_user_version(tmp_path: Path):
     db = Database(tmp_path / "test.db")
     version = db.conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == CURRENT_VERSION
-    assert version == 3
+    assert version == 4
     db.close()
 
 
@@ -110,7 +111,7 @@ def test_idempotent_migration(tmp_path: Path):
     db = Database(tmp_path / "test.db")
     db.close()
     db2 = Database(tmp_path / "test.db")
-    assert db2.conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db2.conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION
     db2.close()
 
 
@@ -148,17 +149,18 @@ def test_multi_open_sessions_allowed(tmp_path: Path):
     db.close()
 
 
-def test_migration_v2_to_v3(tmp_path: Path):
+def test_migration_v2_to_latest(tmp_path: Path):
     path = tmp_path / "v2.db"
     _make_v2(path)
     db = Database(path)
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION
 
     tables = _tables(db)
     assert "inbox" not in tables
     assert "snapshot_progress" in tables
     assert "locks" in tables
     assert "snapshots" in tables
+    assert "last_reads" in tables
     assert "idx_one_open_session" not in _indexes(db)
 
     cols = {r["name"] for r in db.fetchall("PRAGMA table_info(edits)")}

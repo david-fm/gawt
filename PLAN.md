@@ -329,6 +329,14 @@ Eliminar `tests/test_inbox.py`.
 4. ✅ Sin toggle de diff — `git diff` puro; los snapshots del worktree aspiran a diffs pequeños
 5. ✅ Crash-medio: **reconciliación observada** (`adjusted` rows), no trans-App-máquina
 
+## 14a. Decisiones nuevas — v0.6.1 (feedback de ejecución real)
+
+1. ✅ **`expected_sha256` sale de la API MCP.** El agente lo manejaba mal (schema string obligatorio, sentinel `"null"`). Ahora gawt guarda en una tabla `last_reads(agent_id, file, sha256, ts)` la última lectura de cada agente por archivo; el write verifica contra ella automáticamente y rechaza con `STALE_WRITE` si quedó vieja. El agente ya no pasa ni ve SHA. Tras write/edit la fila se actualiza al nuevo SHA; tras delete se borra.
+2. ✅ **Read legible, sin `diff`.** `read_file` devuelve `content`, `sha256`, `base_sha`, `edits[]` (con `op`, `role` resuelto, `intent` texto, `intent_id`, `ts`) y `warning` de intent. El `diff` solo vive en `snapshot_status` (donde tiene sentido: estado global vs target). La intención y el rol ya aparecen en el read y en el rechazo `STALE_WRITE` (mismo payload), sin depender de `list_edits`.
+3. ✅ **Aviso de lectura vieja.** Si lees un archivo y tu `last_reads` apunta a un SHA distinto del actual → `note` breve en la respuesta (alguien más escribió después de tu última lectura) + warning de intent como siempre.
+4. ✅ `list_edits` resuelve `intent` texto y `role` (JOIN) para trazabilidad sin llamadas extra.
+5. Migración `user_version` 3 → 4: `CREATE TABLE last_reads(agent_id, file, sha256, ts, PRIMARY KEY(agent_id, file))`.
+
 ## 15. Orden de implementación
 
 1. Rama `feat/v0.6-...`.. `git checkout -b feat/v0.6-pheromone-snapshot` + migraciones.

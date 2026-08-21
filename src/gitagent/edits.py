@@ -84,13 +84,56 @@ def _record_edit(
 
 
 def _edit_rows(file: str, db: Database) -> list[dict]:
+    """Pheromone rows for *file*: op + role + intent text, ordered by id."""
     rows = db.fetchall(
-        """SELECT e.*, a.role AS role
-           FROM edits e LEFT JOIN agents a ON a.id = e.agent_id
-           WHERE e.file = ? ORDER BY e.id""",
+        """SELECT e.id AS edit_id, e.agent_id, a.role, e.op, e.file,
+                  e.replace_all, e.intent_id, i.intent, e.ts
+           FROM edits e
+           LEFT JOIN agents a ON a.id = e.agent_id
+           LEFT JOIN intents i ON i.id = e.intent_id
+           WHERE e.file = ?
+           ORDER BY e.id""",
         (file,),
     )
     return [dict(r) for r in rows]
+
+
+def _last_read(agent_id: str, file: str, db: Database) -> dict | None:
+    row = db.fetchone(
+        "SELECT sha256, ts FROM last_reads WHERE agent_id = ? AND file = ?",
+        (agent_id, file),
+    )
+    return dict(row) if row else None
+
+
+def _set_last_read(agent_id: str, file: str, sha256: str, db: Database) -> None:
+    db.execute(
+        """INSERT INTO last_reads (agent_id, file, sha256, ts)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(agent_id, file) DO UPDATE SET
+             sha256 = excluded.sha256, ts = excluded.ts""",
+        (agent_id, file, sha256, _now()),
+    )
+    db.commit()
+
+
+def _clear_last_read(agent_id: str, file: str, db: Database) -> None:
+    db.execute(
+        "DELETE FROM last_reads WHERE agent_id = ? AND file = ?",
+        (agent_id, file),
+    )
+    db.commit()
+
+
+def _stale_against_read(agent_id: str, file: str, current_sha: str | None, db: Database) -> bool:
+    """True if this agent read the file before but the disk changed since.
+
+    The agent never passes a SHA anymore — gawt remembers the last read.
+    """
+    prev = _last_read(agent_id, file, db)
+    if prev is None:
+        return False
+    return prev["sha256"] != current_sha
 
 
 def _read_payload(
@@ -105,14 +148,12 @@ def _read_payload(
     sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
     cwd = Path(srow["worktree"])
     base_sha = gitwrap.current_sha(cwd=gitwrap.main_repo_root(cwd))
-    _, diff = gitwrap.diff_vs_ref(srow["target_branch"], file, cwd=cwd)
 
     return {
         "content": content,
         "sha256": sha,
         "path": file,
         "base_sha": base_sha,
-        "diff": diff,
         "edits": _edit_rows(file, db),
     }
 
@@ -173,15 +214,14 @@ def edit(
     new_string: str,
     *,
     replace_all: bool = False,
-    expected_sha256: str | None = None,
     db: Database | None = None,
 ) -> dict:
     """Exact-match string replacement with atomic write + lock.
 
     On success returns ``{ok: True, path, matches}``. A fresh foreign lock
-    (or STALE_WRITE) returns ``{status: 'rejected', read: {...}}`` with no
-    write applied. Raises ``old_string_not_found`` / ``ambiguous_match`` on
-    stale reads.
+    (or a read that went stale since ``last_reads``) returns
+    ``{status: 'rejected', read: {...}}`` with no write applied. Raises
+    ``old_string_not_found`` / ``ambiguous_match`` on stale reads.
     """
     db = db or get_db()
     agent = validate_agent(agent_id, db)
@@ -202,12 +242,9 @@ def edit(
             raise GitAgentError(f"File not found: {file}")
 
         content = target.read_text(encoding="utf-8")
-        if expected_sha256 is not None:
-            actual_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            if actual_sha256 != expected_sha256:
-                return _reject(
-                    agent, file, db, srow, reason="STALE_WRITE"
-                )
+        current_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if _stale_against_read(agent_id, file, current_sha, db):
+            return _reject(agent, file, db, srow, reason="STALE_WRITE")
 
         count = content.count(old_string)
         if count == 0:
@@ -227,6 +264,10 @@ def edit(
             new_content = content.replace(old_string, new_string, 1)
 
         _atomic_write(target, new_content.encode("utf-8"))
+        _set_last_read(
+            agent_id, file,
+            hashlib.sha256(new_content.encode("utf-8")).hexdigest(), db,
+        )
 
         intent = get_current_intent(agent_id, db)
         intent_id = intent["intent_id"] if intent else None
@@ -246,10 +287,14 @@ def write(
     file: str,
     content: str,
     *,
-    expected_sha256: str | None = None,
     db: Database | None = None,
 ) -> dict:
-    """Create or overwrite a file with atomic write + lock."""
+    """Create or overwrite a file with atomic write + lock.
+
+    If this agent read the file before and the disk changed since (another
+    agent wrote), the write is rejected with STALE_WRITE instead of silently
+    clobbering. A file this agent has never read can always be written.
+    """
     db = db or get_db()
     agent = validate_agent(agent_id, db)
     srow = _agent_session(agent, db)
@@ -265,14 +310,20 @@ def write(
             return _reject_for_lock(acquired, agent, file, db, srow)
         token = acquired["token"]
 
-        if expected_sha256 is not None:
-            if not target.exists():
-                raise GitAgentError(f"STALE_WRITE: expected existing file '{file}'.")
-            actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
-            if actual_sha256 != expected_sha256:
+        if target.exists():
+            current_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+            if _stale_against_read(agent_id, file, current_sha, db):
                 return _reject(agent, file, db, srow, reason="STALE_WRITE")
+        elif _last_read(agent_id, file, db) is not None:
+            # This agent read the file before, but it is gone now (deleted
+            # out from under them) -> treat as stale.
+            return _reject(agent, file, db, srow, reason="STALE_WRITE")
 
         _atomic_write(target, content.encode("utf-8"))
+        _set_last_read(
+            agent_id, file,
+            hashlib.sha256(content.encode("utf-8")).hexdigest(), db,
+        )
 
         intent = get_current_intent(agent_id, db)
         intent_id = intent["intent_id"] if intent else None
@@ -287,18 +338,30 @@ def write(
 
 
 def read(agent_id: str, file: str, *, db: Database | None = None) -> dict:
-    """Informed read. Returns content + sha + base_sha + diff + edits + warning."""
+    """Informed read. content + sha + base_sha + edits[] (with intent) + warning.
+
+    Records the last-read SHA so a later write by this agent is validated
+    against it (STALE_WRITE if the disk changed in between).
+    """
     db = db or get_db()
     agent = validate_agent(agent_id, db)
     srow = _agent_session(agent, db)
     payload = _read_payload(agent["id"], file, db, agent, srow)
+
+    prev = _last_read(agent_id, file, db)
+    if prev is not None and prev["sha256"] != payload["sha256"]:
+        payload["note"] = (
+            "Tu última lectura de este archivo ya no es la versión actual: "
+            "otro agente escribió después. Relee y replanifica antes de escribir."
+        )
+    _set_last_read(agent_id, file, payload["sha256"], db)
+
     payload["warning"] = WARNING
     return payload
 
 
 def delete_file(
-    agent_id: str, file: str, *, expected_sha256: str | None = None,
-    db: Database | None = None,
+    agent_id: str, file: str, *, db: Database | None = None,
 ) -> dict:
     """Remove a file with lock. Returns ``{ok: True, path}``."""
     db = db or get_db()
@@ -317,11 +380,11 @@ def delete_file(
         token = acquired["token"]
 
         if target.exists():
-            if expected_sha256 is not None:
-                actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
-                if actual_sha256 != expected_sha256:
-                    return _reject(agent, file, db, srow, reason="STALE_WRITE")
+            current_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+            if _stale_against_read(agent_id, file, current_sha, db):
+                return _reject(agent, file, db, srow, reason="STALE_WRITE")
             target.unlink()
+        _clear_last_read(agent_id, file, db)
 
         intent = get_current_intent(agent_id, db)
         intent_id = intent["intent_id"] if intent else None
@@ -367,6 +430,11 @@ def list_edits(
     if limit is not None:
         params.append(limit)
     rows = db.fetchall(
-        f"SELECT * FROM edits{where} ORDER BY id{snippet}", tuple(params)
+        f"""SELECT e.*, a.role AS role, i.intent AS intent
+            FROM edits e
+            LEFT JOIN agents a ON a.id = e.agent_id
+            LEFT JOIN intents i ON i.id = e.intent_id
+            {where} ORDER BY e.id{snippet}""",
+        tuple(params),
     )
     return [dict(r) for r in rows]

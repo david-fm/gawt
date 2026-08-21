@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed (BREAKING) — v0.6.0
+### Changed (BREAKING) — v0.6.1
+- **`expected_sha256` removed from the MCP API.** Agents handled it badly (schema required a string, callers passed `"null"`/`""` sentinels). gawt now tracks each agent's **last read per file** in a new `last_reads` table and validates writes against it automatically, rejecting with `STALE_WRITE` when the disk changed since that read. Agents never pass or see a SHA. The row is updated after write/edit and cleared after delete.
+- **`read_file` is readable: no `diff`.** Returns `content`, `sha256`, `base_sha`, `edits[]` (with `op`, resolved `role`, `intent` text, `intent_id`, `ts`), and `warning`. The git `diff` now lives only in `snapshot_status` (whole-worktree view). Intent + role already appear in the read **and** in the `STALE_WRITE`/lock rejection payload, so the coordinator no longer needs a separate `list_edits` call.
+- **Stale-read notice.** Reading a file whose last read no longer matches the current disk content returns a short `note`.
+- `list_edits` resolves `intent` text and `role` (JOIN).
+- Schema migration `user_version` 3 → 4: `CREATE TABLE last_reads(agent_id, file, sha256, ts, PRIMARY KEY(agent_id, file))`.
+
+## [0.6.0] - 2026-08-20
 - **Inbox removed.** `check_inbox` / `send_message` / `inbox.py` are gone. Coordination now emerges from the **pheromone** (the `edits` log), not messages.
 - **Per-file write locks.** `write_file` / `edit_file` / `delete_file` acquire a lock first and always release it in `finally`. A fresh foreign lock → **informed rejection** (`{status: "rejected", read: {...}}`), never applied. No waiting in the server.
 - **Reads are informed (git-style).** Same `read_file` tool now returns `content`, `sha256`, `path`, `base_sha`, `diff`, `edits[]`, and an intent `warning`. No diff toggle — the git diff is always present.
